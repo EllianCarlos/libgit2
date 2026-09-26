@@ -4,6 +4,7 @@
 #include "common.h"
 
 #include "git2/blame.h"
+#include "git2/sys/blame.h"
 #include "vector.h"
 #include "diff.h"
 #include "array.h"
@@ -86,6 +87,9 @@ struct git_blame {
 	int num_lines;
 	const char *final_buf;
 	size_t final_buf_size;
+
+	/* Shared work between blames of the same repository, or NULL. */
+	git_blame_cache *cache;
 };
 
 git_blame *git_blame__alloc(

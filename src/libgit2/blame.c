@@ -490,6 +490,16 @@ int git_blame_file(
 		const char *path,
 		git_blame_options *options)
 {
+	return git_blame_file_cached(out, repo, path, options, NULL);
+}
+
+int git_blame_file_cached(
+		git_blame **out,
+		git_repository *repo,
+		const char *path,
+		git_blame_options *options,
+		git_blame_cache *cache)
+{
 	int error = -1;
 	git_blame_options normOptions = GIT_BLAME_OPTIONS_INIT;
 	git_blame *blame = NULL;
@@ -503,6 +513,7 @@ int git_blame_file(
 
 	blame = git_blame__alloc(repo, normOptions, path);
 	GIT_ERROR_CHECK_ALLOC(blame);
+	blame->cache = cache;
 
 	if ((error = load_blob(blame)) < 0)
 		goto on_error;
