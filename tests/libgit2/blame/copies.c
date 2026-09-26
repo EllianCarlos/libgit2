@@ -164,3 +164,145 @@ void test_blame_copies__move_within_file_threshold(void)
 	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
 	check_hunk(2, 7, 2, 0, "3da1ad7", "move.txt", 7);
 }
+
+void test_blame_copies__move_between_files_needs_flag(void)
+{
+	blame("to.txt", GIT_BLAME_TRACK_COPIES_SAME_FILE, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 2, 1, "37495f8", "to.txt", 1);
+	check_hunk(1, 3, 2, 0, "c8343a8", "to.txt", 3);
+	check_hunk(2, 5, 2, 1, "37495f8", "to.txt", 3);
+}
+
+void test_blame_copies__move_between_files(void)
+{
+	blame("to.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 2, 1, "37495f8", "to.txt", 1);
+	check_hunk(1, 3, 2, 1, "37495f8", "from.txt", 3);
+	check_hunk(2, 5, 2, 1, "37495f8", "to.txt", 3);
+}
+
+void test_blame_copies__move_from_renamed_file(void)
+{
+	/* Follow the other file to its old name, too. */
+	blame("target-r.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 2, 1, "37495f8", "target-r.txt", 1);
+	check_hunk(1, 3, 2, 1, "37495f8", "lib-old.txt", 3);
+	check_hunk(2, 5, 2, 1, "37495f8", "target-r.txt", 3);
+}
+
+void test_blame_copies__default_threshold(void)
+{
+	/*
+	 * The default threshold is 40 alphanumeric characters: the block
+	 * with 39 stays with c4, the blocks with 40, 99 and 100 move.
+	 */
+	blame("thresh.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(7, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 4, 0, "15273bd", "thresh.txt", 1);
+	check_hunk(1, 5, 2, 1, "37495f8", "thresh-src.txt", 5);
+	check_hunk(2, 7, 1, 0, "15273bd", "thresh.txt", 7);
+	check_hunk(3, 8, 2, 1, "37495f8", "thresh-src.txt", 8);
+	check_hunk(4, 10, 1, 0, "15273bd", "thresh.txt", 10);
+	check_hunk(5, 11, 2, 1, "37495f8", "thresh-src.txt", 11);
+	check_hunk(6, 13, 1, 0, "15273bd", "thresh.txt", 13);
+}
+
+void test_blame_copies__threshold_of_100(void)
+{
+	/* Like `git blame -C100`: only the block with 100 characters moves. */
+	blame("thresh.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 100);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 10, 0, "15273bd", "thresh.txt", 1);
+	check_hunk(1, 11, 2, 1, "37495f8", "thresh-src.txt", 11);
+	check_hunk(2, 13, 1, 0, "15273bd", "thresh.txt", 13);
+}
+
+void test_blame_copies__threshold_with_line_range(void)
+{
+	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
+
+	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES;
+	opts.min_line = 4;
+	opts.max_line = 6;
+	cl_git_pass(git_blame_file(&g_blame, g_repo, "thresh.txt", &opts));
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 4, 1, 0, "15273bd", "thresh.txt", 4);
+	check_hunk(1, 5, 2, 1, "37495f8", "thresh-src.txt", 5);
+}
+
+void test_blame_copies__copy_from_unmodified_file_needs_flag(void)
+{
+	blame("newcopy.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 4, 0, "ddda373", "newcopy.txt", 1);
+}
+
+void test_blame_copies__merge(void)
+{
+	blame("merge-b.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "merge-b.txt", 1);
+	check_hunk(1, 4, 2, 1, "37495f8", "merge-a.txt", 3);
+}
+
+void test_blame_copies__merge_first_parent(void)
+{
+	/*
+	 * The first parent of the merge does not have the block in any
+	 * file that the merge changed, so the merge keeps it.
+	 */
+	blame("merge-b.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES |
+		GIT_BLAME_FIRST_PARENT, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "merge-b.txt", 1);
+	check_hunk(1, 4, 2, 0, "8b338b8", "merge-b.txt", 4);
+}
+
+void test_blame_copies__binary_file(void)
+{
+	blame("binary.bin", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(1, 2, 2, 0, "5956d82", "binary.bin", 2);
+
+	blame("binary.bin", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 1, 1, "37495f8", "binary.bin", 1);
+	check_hunk(1, 2, 2, 1, "37495f8", "bin-src.bin", 2);
+	check_hunk(2, 4, 1, 1, "37495f8", "binary.bin", 2);
+}
+
+void test_blame_copies__empty_file(void)
+{
+	const git_blame_hunk *hunk;
+
+	/* An empty file has one empty hunk, with or without copies. */
+	blame("empty.txt", GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES, 0);
+
+	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
+	cl_assert((hunk = git_blame_hunk_byindex(g_blame, 0)) != NULL);
+	cl_assert_equal_i(0, hunk->lines_in_hunk);
+	cl_assert_equal_s("empty.txt", hunk->orig_path);
+}
+
+void test_blame_copies__file_in_root_commit(void)
+{
+	/* The root commit has no parent to search for copies. */
+	blame("root.txt", GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES, 0);
+
+	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "root.txt", 1);
+}

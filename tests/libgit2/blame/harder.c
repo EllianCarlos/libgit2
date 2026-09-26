@@ -67,14 +67,22 @@ void test_blame_harder__m(void)
 
 void test_blame_harder__c(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the first hunk in b.txt to (E), since it was cut/pasted from
-	 * a.txt in (D).
+	/*
+	 * Attribute the first hunk in b.txt to (E), since it was cut/pasted
+	 * from a.txt in (D).  Attribute the third hunk to (E) too: (C)
+	 * copied it from a.txt, which (C) also modified.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	cl_assert_equal_i(22,
+		git_blame_hunk_byindex(blame, 0)->orig_start_line_number);
+	cl_assert_equal_i(7,
+		git_blame_hunk_byindex(blame, 2)->orig_start_line_number);
+	git_blame_free(blame);
 }
 
 void test_blame_harder__cc(void)

@@ -306,10 +306,19 @@ static void dup_entry(git_blame__entry *dst, git_blame__entry *src)
 /*
  * split_overlap() divided an existing blame e into up to three parts in split.
  * Adjust the linked list of blames in the scoreboard to reflect the split.
+ * If tail is not NULL, it is set to the entry that holds the part after the
+ * chunk, or to NULL if there is no such part.
  */
-static int split_blame(git_blame *blame, git_blame__entry *split, git_blame__entry *e)
+static int split_blame(
+		git_blame *blame,
+		git_blame__entry *split,
+		git_blame__entry *e,
+		git_blame__entry **tail)
 {
 	git_blame__entry *new_entry;
+
+	if (tail)
+		*tail = NULL;
 
 	if (split[0].suspect && split[2].suspect) {
 		/* The first part (reuse storage for the existing entry e */
@@ -320,6 +329,8 @@ static int split_blame(git_blame *blame, git_blame__entry *split, git_blame__ent
 		GIT_ERROR_CHECK_ALLOC(new_entry);
 		memcpy(new_entry, &(split[2]), sizeof(git_blame__entry));
 		add_blame_entry(blame, new_entry);
+		if (tail)
+			*tail = new_entry;
 
 		/* ... and the middle part -- parent */
 		new_entry = git__malloc(sizeof(*new_entry));
@@ -346,6 +357,8 @@ static int split_blame(git_blame *blame, git_blame__entry *split, git_blame__ent
 		GIT_ERROR_CHECK_ALLOC(new_entry);
 		memcpy(new_entry, &(split[2]), sizeof(git_blame__entry));
 		add_blame_entry(blame, new_entry);
+		if (tail)
+			*tail = new_entry;
 	}
 
 	return 0;
@@ -378,7 +391,7 @@ static int blame_overlap(
 
 	split_overlap(split, e, tlno, plno, same, parent);
 	if (split[1].suspect)
-		if (split_blame(blame, split, e) < 0)
+		if (split_blame(blame, split, e, NULL) < 0)
 			return -1;
 	decref_split(split);
 
@@ -1013,18 +1026,34 @@ static int pass_whole_blame(git_blame *blame,
 }
 
 /*
- * The default threshold for the detection of moved lines, in alphanumeric
- * characters.  This is the default of `git blame -M`.
+ * The default thresholds for the detection of moved and copied lines,
+ * in alphanumeric characters.  These are the defaults of `git blame -M`
+ * and `git blame -C`.
  */
 #define BLAME_DEFAULT_MOVE_SCORE 20
+#define BLAME_DEFAULT_COPY_SCORE 40
 
-/* The threshold for lines that moved within a file. */
+/*
+ * The threshold for lines that moved within a file.  `min_match_characters`
+ * sets it only when no copy detection across files is requested; like
+ * `git blame -M -C<num>`, moves in the same file then use the default.
+ */
 static unsigned blame_move_score(git_blame *blame)
+{
+	if (blame->options.min_match_characters &&
+	    !(blame->options.flags & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES))
+		return blame->options.min_match_characters;
+
+	return BLAME_DEFAULT_MOVE_SCORE;
+}
+
+/* The threshold for lines that moved or were copied from other files. */
+static unsigned blame_copy_score(git_blame *blame)
 {
 	if (blame->options.min_match_characters)
 		return blame->options.min_match_characters;
 
-	return BLAME_DEFAULT_MOVE_SCORE;
+	return BLAME_DEFAULT_COPY_SCORE;
 }
 
 GIT_INLINE(const char *) blame_nth_line(git_blame *blame, size_t lno)
@@ -1255,7 +1284,7 @@ static int find_move_in_parent(
 			 * moved lines themselves.  Look at it again; the part
 			 * after them follows in the list.
 			 */
-			error = split_blame(blame, split, e);
+			error = split_blame(blame, split, e, NULL);
 		} else {
 			e = e->next;
 		}
@@ -1267,6 +1296,252 @@ static int find_move_in_parent(
 	}
 
 	return 0;
+}
+
+/* A blame entry that may have been copied, and its best split so far. */
+typedef struct {
+	git_blame__entry *ent;
+	git_blame__entry split[3];
+} blame_copy_candidate;
+
+typedef git_array_t(blame_copy_candidate) blame_copy_candidates;
+
+/* Add `e` to the candidates, if it scores above the copy threshold. */
+static int add_copy_candidate(
+		blame_copy_candidates *candidates,
+		git_blame *blame,
+		git_blame__entry *e)
+{
+	blame_copy_candidate *c;
+
+	if (blame_entry_score(blame, e) <= blame_copy_score(blame))
+		return 0;
+
+	c = git_array_alloc(*candidates);
+	GIT_ERROR_CHECK_ALLOC(c);
+
+	memset(c, 0, sizeof(*c));
+	c->ent = e;
+	return 0;
+}
+
+static void clear_copy_candidates(blame_copy_candidates *candidates)
+{
+	blame_copy_candidate *c;
+	size_t i;
+
+	git_array_foreach(*candidates, i, c)
+		decref_split(c->split);
+
+	git_array_clear(*candidates);
+}
+
+/*
+ * List the files of `parent` to search for copied lines: the files that
+ * were modified or deleted between `parent` and the commit of `target`.
+ */
+static int diff_copy_sources(
+		git_diff **out,
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent)
+{
+	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
+	git_tree *otree = NULL, *ptree = NULL;
+	int error;
+
+	diffopts.context_lines = 0;
+	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK;
+
+	if ((error = git_commit_tree(&otree, target->commit)) < 0 ||
+	    (error = git_commit_tree(&ptree, parent)) < 0)
+		goto done;
+
+	error = git_diff_tree_to_tree(out, blame->repository, ptree, otree,
+		&diffopts);
+
+done:
+	git_tree_free(otree);
+	git_tree_free(ptree);
+	return error;
+}
+
+/*
+ * Whether the old side of `delta` is a file of the parent to search for
+ * copied lines.  The file that `find_move_in_parent` has searched already,
+ * and submodules, are not.
+ */
+static bool is_copy_source(
+		const git_diff_delta *delta,
+		git_blame__origin *porigin)
+{
+	if (delta->status == GIT_DELTA_ADDED ||
+	    delta->old_file.mode == GIT_FILEMODE_UNREADABLE ||
+	    delta->old_file.mode == GIT_FILEMODE_TREE ||
+	    delta->old_file.mode == GIT_FILEMODE_COMMIT)
+		return false;
+
+	return !porigin || strcmp(delta->old_file.path, porigin->path) != 0;
+}
+
+/* Create an origin for the old side of `delta`, a file of `parent`. */
+static int make_source_origin(
+		git_blame__origin **out,
+		git_blame *blame,
+		git_commit *parent,
+		const git_diff_delta *delta)
+{
+	git_commit *commit = NULL;
+	git_blob *blob = NULL;
+	int error;
+
+	if ((error = git_commit_dup(&commit, parent)) < 0 ||
+	    (error = git_blob_lookup(&blob, blame->repository,
+			&delta->old_file.id)) < 0 ||
+	    (error = new_origin(out, commit, blob, delta->old_file.path,
+			delta->old_file.mode)) < 0) {
+		git_blob_free(blob);
+		git_commit_free(commit);
+	}
+
+	return error;
+}
+
+/*
+ * Search every source file for the best match of every candidate, and
+ * record it in the candidate.
+ */
+static int find_best_copies(
+		git_blame *blame,
+		blame_copy_candidates *candidates,
+		git_commit *parent,
+		git_diff *diff,
+		git_blame__origin *porigin)
+{
+	git_blame__entry potential[3];
+	git_blame__origin *norigin;
+	blame_copy_candidate *c;
+	mmfile_t file_p;
+	size_t i, j;
+	int error = 0;
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+
+		if (!is_copy_source(delta, porigin))
+			continue;
+
+		if ((error = make_source_origin(&norigin, blame, parent,
+				delta)) < 0)
+			return error;
+
+		fill_origin_blob(norigin, &file_p);
+
+		git_array_foreach(*candidates, j, c) {
+			memset(potential, 0, sizeof(potential));
+
+			if ((error = find_copy_in_blob(blame, c->ent, norigin,
+					potential, &file_p)) == 0)
+				copy_split_if_better(blame, c->split, potential);
+
+			decref_split(potential);
+
+			if (error < 0)
+				break;
+		}
+
+		origin_decref(norigin);
+
+		if (error < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+/*
+ * Find lines that `target` is still suspected for in the files of `parent`
+ * (a parent of the commit of `target`) other than `porigin`: this detects
+ * lines that were moved or copied from other files.  Each candidate entry
+ * goes to the file with the best match, if that match scores above the
+ * copy threshold; the parts of the entry that are left are searched again.
+ *
+ * Returns 1 when no line that `target` is suspected for is worth a
+ * search anymore, 0 when some still are, and a negative error code on
+ * failure.
+ */
+static int find_copy_in_parent(
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent,
+		git_blame__origin *porigin)
+{
+	blame_copy_candidates candidates = GIT_ARRAY_INIT, next = GIT_ARRAY_INIT;
+	unsigned threshold = blame_copy_score(blame);
+	blame_copy_candidate *c;
+	git_blame__entry *e, *tail;
+	git_diff *diff = NULL;
+	size_t i;
+	int error = 0;
+
+	for (e = blame->ent; e; e = e->next) {
+		if (e->guilty || !same_suspect(e->suspect, target))
+			continue;
+		if ((error = add_copy_candidate(&candidates, blame, e)) < 0)
+			goto done;
+	}
+
+	if (!git_array_size(candidates)) {
+		error = 1;
+		goto done;
+	}
+
+	if ((error = diff_copy_sources(&diff, blame, target, parent)) < 0)
+		goto done;
+
+	while (git_array_size(candidates)) {
+		if ((error = find_best_copies(blame, &candidates, parent,
+				diff, porigin)) < 0)
+			goto done;
+
+		git_array_foreach(candidates, i, c) {
+			if (!c->split[1].suspect ||
+			    blame_entry_score(blame, &c->split[1]) <= threshold)
+				continue;
+
+			if ((error = split_blame(blame, c->split, c->ent,
+					&tail)) < 0)
+				goto done;
+
+			/* Search the parts that are left again. */
+			if (c->split[0].suspect)
+				error = add_copy_candidate(&next, blame, c->ent);
+			if (!error && tail)
+				error = add_copy_candidate(&next, blame, tail);
+			if (error < 0)
+				goto done;
+		}
+
+		clear_copy_candidates(&candidates);
+		candidates = next;
+		git_array_init(next);
+	}
+
+	/* Is any line left that is worth a search in another parent? */
+	error = 1;
+	for (e = blame->ent; e; e = e->next) {
+		if (!e->guilty && same_suspect(e->suspect, target) &&
+		    blame_entry_score(blame, e) > threshold) {
+			error = 0;
+			break;
+		}
+	}
+
+done:
+	clear_copy_candidates(&candidates);
+	clear_copy_candidates(&next);
+	git_diff_free(diff);
+	return error;
 }
 
 static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
@@ -1387,7 +1662,27 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 		}
 	}
 
-	/* TODO: optionally find copies in parents' files */
+	/*
+	 * Optionally find copies from parents' files.
+	 */
+	if (opt & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES) {
+		for (i = 0; i < num_parents; i++) {
+			git_commit *p;
+
+			if ((error = git_commit_parent(&p, commit, i)) < 0)
+				goto finish;
+
+			ret = find_copy_in_parent(blame, origin, p, sg_origin[i]);
+			git_commit_free(p);
+
+			if (ret != 0) {
+				if (ret < 0)
+					error = ret;
+
+				goto finish;
+			}
+		}
+	}
 
 finish:
 	for (i=0; i<num_parents; i++)
