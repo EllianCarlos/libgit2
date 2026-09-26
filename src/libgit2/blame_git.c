@@ -33,17 +33,19 @@ static void origin_decref(git_blame__origin *o)
 	}
 }
 
-/* Given a commit and a path in it, create a new origin structure. */
-static int make_origin(git_blame__origin **out, git_commit *commit, const char *path)
+/*
+ * Create a new origin structure for a blob at a path in a commit. On
+ * success, the origin takes ownership of the commit and the blob.
+ */
+static int new_origin(
+	git_blame__origin **out,
+	git_commit *commit,
+	git_blob *blob,
+	const char *path,
+	uint16_t mode)
 {
 	git_blame__origin *o;
-	git_object *blob;
 	size_t path_len = strlen(path), alloc_len;
-	int error = 0;
-
-	if ((error = git_object_lookup_bypath(&blob, (git_object*)commit,
-			path, GIT_OBJECT_BLOB)) < 0)
-		return error;
 
 	GIT_ERROR_CHECK_ALLOC_ADD(&alloc_len, sizeof(*o), path_len);
 	GIT_ERROR_CHECK_ALLOC_ADD(&alloc_len, alloc_len, 1);
@@ -51,13 +53,99 @@ static int make_origin(git_blame__origin **out, git_commit *commit, const char *
 	GIT_ERROR_CHECK_ALLOC(o);
 
 	o->commit = commit;
-	o->blob = (git_blob *) blob;
+	o->blob = blob;
+	o->mode = mode;
 	o->refcnt = 1;
 	strcpy(o->path, path);
 
 	*out = o;
 
 	return 0;
+}
+
+/*
+ * Look up the file at `path` in the tree of `commit`.  Sets `*out` to NULL
+ * when there is no file there: the path does not exist, or it is a
+ * directory or a submodule.
+ */
+static int lookup_file(
+	git_tree_entry **out,
+	git_commit *commit,
+	const char *path)
+{
+	git_tree *tree = NULL;
+	int error;
+
+	*out = NULL;
+
+	if ((error = git_commit_tree(&tree, commit)) < 0)
+		return error;
+
+	error = git_tree_entry_bypath(out, tree, path);
+	git_tree_free(tree);
+
+	if (error == GIT_ENOTFOUND) {
+		git_error_clear();
+		return 0;
+	} else if (error < 0) {
+		return error;
+	}
+
+	if (git_tree_entry_type(*out) != GIT_OBJECT_BLOB) {
+		git_tree_entry_free(*out);
+		*out = NULL;
+	}
+
+	return 0;
+}
+
+/*
+ * Create a new origin for the file `entry` at `path` in `commit`. On
+ * success, the origin takes ownership of the commit.
+ */
+static int make_origin_from_entry(
+	git_blame__origin **out,
+	git_repository *repo,
+	git_commit *commit,
+	const char *path,
+	const git_tree_entry *entry)
+{
+	git_blob *blob;
+	int error;
+
+	if ((error = git_blob_lookup(&blob, repo, git_tree_entry_id(entry))) < 0)
+		return error;
+
+	if ((error = new_origin(out, commit, blob, path,
+			(uint16_t)git_tree_entry_filemode_raw(entry))) < 0)
+		git_blob_free(blob);
+
+	return error;
+}
+
+/* Given a commit and a path in it, create a new origin structure. */
+static int make_origin(
+	git_blame__origin **out,
+	git_commit *commit,
+	const char *path)
+{
+	git_tree_entry *entry;
+	int error;
+
+	if ((error = lookup_file(&entry, commit, path)) < 0)
+		return error;
+
+	if (!entry) {
+		git_error_set(GIT_ERROR_INVALID,
+			"the path '%s' is not a file in the commit", path);
+		return GIT_ENOTFOUND;
+	}
+
+	error = make_origin_from_entry(out, git_commit_owner(commit),
+		commit, path, entry);
+	git_tree_entry_free(entry);
+
+	return error;
 }
 
 /* Locate an existing origin or create a new one. */
@@ -72,6 +160,7 @@ int git_blame__get_origin(
 	for (e = blame->ent; e; e = e->next) {
 		if (e->suspect->commit == commit && !strcmp(e->suspect->path, path)) {
 			*out = origin_incref(e->suspect);
+			return 0;
 		}
 	}
 	return make_origin(out, commit, path);
@@ -421,74 +510,163 @@ static int pass_blame_to_parent(
 	return 0;
 }
 
-static int paths_on_dup(void **old, void *new)
-{
-	GIT_UNUSED(old);
-	git__free(new);
-	return -1;
-}
-
-static git_blame__origin *find_origin(
+/*
+ * Look for the file of `origin` at the same path in `parent`.  Sets `*out`
+ * to NULL when the path is not a file of the same type there, like git
+ * does for a path that the commit added or changed the type of.
+ */
+static int find_origin(
+		git_blame__origin **out,
 		git_blame *blame,
 		git_commit *parent,
 		git_blame__origin *origin)
 {
-	git_blame__origin *porigin = NULL;
-	git_diff *difflist = NULL;
+	git_tree_entry *entry;
+	int error;
+
+	*out = NULL;
+
+	if ((error = lookup_file(&entry, parent, origin->path)) < 0 || !entry)
+		return error;
+
+	if (GIT_MODE_TYPE(git_tree_entry_filemode_raw(entry)) ==
+	    GIT_MODE_TYPE(origin->mode))
+		error = make_origin_from_entry(out, blame->repository, parent,
+			origin->path, entry);
+
+	git_tree_entry_free(entry);
+	return error;
+}
+
+/* Whether the last path components of `a` and `b` are the same. */
+static bool same_basename(const char *a, const char *b)
+{
+	const char *a_base = strrchr(a, '/'), *b_base = strrchr(b, '/');
+
+	return strcmp(a_base ? a_base + 1 : a, b_base ? b_base + 1 : b) == 0;
+}
+
+/*
+ * The number of identical files that git considers, at most, when it
+ * picks the source of an exact rename.
+ */
+#define BLAME_EXACT_RENAME_CANDIDATES 100
+
+/*
+ * Pick the file that `dst` is an exact rename of, among the files that
+ * the diff deletes, like git: the first one in path order with the same
+ * contents and the same basename, or else the first one with the same
+ * contents.  A file that is not a regular file must have the same mode.
+ */
+static const git_diff_delta *find_exact_rename(
+		git_diff *diff,
+		const git_diff_delta *dst)
+{
+	const git_diff_delta *best = NULL;
+	size_t i, candidates = 0;
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+
+		if (delta->status != GIT_DELTA_DELETED ||
+		    !git_oid_equal(&delta->old_file.id, &dst->new_file.id))
+			continue;
+
+		if ((!GIT_MODE_ISBLOB(delta->old_file.mode) ||
+		     !GIT_MODE_ISBLOB(dst->new_file.mode)) &&
+		    delta->old_file.mode != dst->new_file.mode)
+			continue;
+
+		if (!best)
+			best = delta;
+
+		if (same_basename(delta->old_file.path, dst->new_file.path)) {
+			best = delta;
+			break;
+		}
+
+		if (++candidates == BLAME_EXACT_RENAME_CANDIDATES)
+			break;
+	}
+
+	return best;
+}
+
+/*
+ * Look for the file that the commit of `origin` renamed to the path of
+ * `origin`, in `parent`.  Sets `*out` to NULL when there is none.
+ */
+static int find_rename(
+		git_blame__origin **out,
+		git_blame *blame,
+		git_commit *parent,
+		git_blame__origin *origin)
+{
 	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
-	git_tree *otree=NULL, *ptree=NULL;
+	git_diff_find_options findopts = GIT_DIFF_FIND_OPTIONS_INIT;
+	git_tree *otree = NULL, *ptree = NULL;
+	const git_diff_delta *dst = NULL, *src = NULL;
+	git_diff *diff = NULL;
+	git_blob *blob = NULL;
+	size_t i;
+	int error;
 
-	/* Get the trees from this commit and its parent */
-	if (0 != git_commit_tree(&otree, origin->commit) ||
-	    0 != git_commit_tree(&ptree, parent))
-		goto cleanup;
+	*out = NULL;
 
-	/* Configure the diff */
 	diffopts.context_lines = 0;
-	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK;
+	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK |
+	                 GIT_DIFF_INCLUDE_TYPECHANGE;
+	findopts.flags = GIT_DIFF_FIND_RENAMES;
 
-	/* Check to see if files we're interested have changed */
-	diffopts.pathspec.count = blame->paths.length;
-	diffopts.pathspec.strings = (char**)blame->paths.contents;
-	if (0 != git_diff_tree_to_tree(&difflist, blame->repository, ptree, otree, &diffopts))
-			goto cleanup;
+	if ((error = git_commit_tree(&otree, origin->commit)) < 0 ||
+	    (error = git_commit_tree(&ptree, parent)) < 0 ||
+	    (error = git_diff_tree_to_tree(&diff, blame->repository,
+			ptree, otree, &diffopts)) < 0)
+		goto done;
 
-	if (!git_diff_num_deltas(difflist)) {
-		/* No changes; copy data */
-		git_blame__get_origin(&porigin, blame, parent, origin->path);
-	} else {
-		git_diff_find_options findopts = GIT_DIFF_FIND_OPTIONS_INIT;
-		int i;
+	/* Only a file that the commit added can be the result of a rename. */
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
 
-		/* Generate a full diff between the two trees */
-		git_diff_free(difflist);
-		diffopts.pathspec.count = 0;
-		if (0 != git_diff_tree_to_tree(&difflist, blame->repository, ptree, otree, &diffopts))
-			goto cleanup;
+		if (!strcmp(delta->new_file.path, origin->path)) {
+			if (delta->status == GIT_DELTA_ADDED)
+				dst = delta;
+			break;
+		}
+	}
 
-		/* Let diff find renames */
-		findopts.flags = GIT_DIFF_FIND_RENAMES;
-		if (0 != git_diff_find_similar(difflist, &findopts))
-			goto cleanup;
+	if (!dst)
+		goto done;
 
-		/* Find one that matches */
-		for (i=0; i<(int)git_diff_num_deltas(difflist); i++) {
-			const git_diff_delta *delta = git_diff_get_delta(difflist, i);
+	if ((src = find_exact_rename(diff, dst)) == NULL) {
+		if ((error = git_diff_find_similar(diff, &findopts)) < 0)
+			goto done;
 
-			if (!git_vector_bsearch(NULL, &blame->paths, delta->new_file.path))
-			{
-				git_vector_insert_sorted(&blame->paths, (void*)git__strdup(delta->old_file.path),
-						paths_on_dup);
-				make_origin(&porigin, parent, delta->old_file.path);
+		for (i = 0; i < git_diff_num_deltas(diff); i++) {
+			const git_diff_delta *delta = git_diff_get_delta(diff, i);
+
+			if (delta->status == GIT_DELTA_RENAMED &&
+			    !strcmp(delta->new_file.path, origin->path)) {
+				src = delta;
+				break;
 			}
 		}
 	}
 
-cleanup:
-	git_diff_free(difflist);
+	if (!src)
+		goto done;
+
+	if ((error = git_blob_lookup(&blob, blame->repository,
+			&src->old_file.id)) < 0 ||
+	    (error = new_origin(out, parent, blob,
+			src->old_file.path, src->old_file.mode)) < 0)
+		git_blob_free(blob);
+
+done:
+	git_diff_free(diff);
 	git_tree_free(otree);
 	git_tree_free(ptree);
-	return porigin;
+	return error;
 }
 
 /*
@@ -518,7 +696,7 @@ static int pass_whole_blame(git_blame *blame,
 static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 {
 	git_commit *commit = origin->commit;
-	int i, num_parents;
+	int i, pass, num_parents;
 	git_blame__origin *sg_buf[16];
 	git_blame__origin *porigin, **sg_origin = sg_buf;
 	int ret, error = 0;
@@ -541,43 +719,59 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 		GIT_ERROR_CHECK_ALLOC(sg_origin);
 	}
 
-	for (i=0; i<num_parents; i++) {
-		git_commit *p;
-		int j, same;
+	/*
+	 * The first pass looks for the same path in the parents, the second
+	 * pass looks for renames in the parents that do not have it.
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		for (i=0; i<num_parents; i++) {
+			git_commit *p;
+			int j, same;
 
-		if (sg_origin[i])
-			continue;
+			if (sg_origin[i])
+				continue;
 
-		if ((error = git_commit_parent(&p, origin->commit, i)) < 0)
-			goto finish;
-		porigin = find_origin(blame, p, origin);
+			if ((error = git_commit_parent(&p, commit, i)) < 0)
+				goto finish;
 
-		if (!porigin) {
-			/*
-			 * We only have to decrement the parent's
-			 * reference count when no porigin has
-			 * been created, as otherwise the commit
-			 * is assigned to the created object.
-			 */
-			git_commit_free(p);
-			continue;
-		}
-		if (porigin->blob && origin->blob &&
-		    !git_oid_cmp(git_blob_id(porigin->blob), git_blob_id(origin->blob))) {
-			error = pass_whole_blame(blame, origin, porigin);
-			origin_decref(porigin);
-			goto finish;
-		}
-		for (j = same = 0; j<i; j++)
-			if (sg_origin[j] &&
-				 !git_oid_cmp(git_blob_id(sg_origin[j]->blob), git_blob_id(porigin->blob))) {
-				same = 1;
-				break;
+			if (pass == 0)
+				error = find_origin(&porigin, blame, p, origin);
+			else
+				error = find_rename(&porigin, blame, p, origin);
+
+			if (error < 0 || !porigin) {
+				/*
+				 * We only have to decrement the parent's
+				 * reference count when no porigin has
+				 * been created, as otherwise the commit
+				 * is assigned to the created object.
+				 */
+				git_commit_free(p);
+
+				if (error < 0)
+					goto finish;
+
+				continue;
 			}
-		if (!same)
-			sg_origin[i] = porigin;
-		else
-			origin_decref(porigin);
+			if (porigin->blob && origin->blob &&
+			    !git_oid_cmp(git_blob_id(porigin->blob),
+					 git_blob_id(origin->blob))) {
+				error = pass_whole_blame(blame, origin, porigin);
+				origin_decref(porigin);
+				goto finish;
+			}
+			for (j = same = 0; j<i; j++)
+				if (sg_origin[j] &&
+				    !git_oid_cmp(git_blob_id(sg_origin[j]->blob),
+						 git_blob_id(porigin->blob))) {
+					same = 1;
+					break;
+				}
+			if (!same)
+				sg_origin[i] = porigin;
+			else
+				origin_decref(porigin);
+		}
 	}
 
 	/* Standard blame */
