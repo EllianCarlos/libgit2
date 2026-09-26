@@ -453,7 +453,12 @@ static void trim_common_tail(mmfile_t *a, mmfile_t *b, long ctx)
 	b->size -= trimmed - recovered;
 }
 
-static int diff_hunks(mmfile_t file_a, mmfile_t file_b, void *cb_data, git_blame_options *options)
+static int diff_hunks(
+	mmfile_t file_a,
+	mmfile_t file_b,
+	xdl_emit_hunk_consume_func_t hunk_func,
+	void *cb_data,
+	git_blame_options *options)
 {
 	xdemitconf_t xecfg = {0};
 	xdemitcb_t ecb = {0};
@@ -465,7 +470,7 @@ static int diff_hunks(mmfile_t file_a, mmfile_t file_b, void *cb_data, git_blame
 	if (options->flags & GIT_BLAME_IGNORE_WHITESPACE)
 		xpp.flags |= XDF_IGNORE_WHITESPACE;
 
-	xecfg.hunk_func = my_emit;
+	xecfg.hunk_func = hunk_func;
 	ecb.priv = cb_data;
 
 	trim_common_tail(&file_a, &file_b, 0);
@@ -503,7 +508,7 @@ static int pass_blame_to_parent(
 	fill_origin_blob(parent, &file_p);
 	fill_origin_blob(target, &file_o);
 
-	if (diff_hunks(file_p, file_o, &d, &blame->options) < 0)
+	if (diff_hunks(file_p, file_o, my_emit, &d, &blame->options) < 0)
 		return -1;
 
 	/* The reset (i.e. anything after tlno) are the same as the parent */
@@ -1007,6 +1012,263 @@ static int pass_whole_blame(git_blame *blame,
 	return 0;
 }
 
+/*
+ * The default threshold for the detection of moved lines, in alphanumeric
+ * characters.  This is the default of `git blame -M`.
+ */
+#define BLAME_DEFAULT_MOVE_SCORE 20
+
+/* The threshold for lines that moved within a file. */
+static unsigned blame_move_score(git_blame *blame)
+{
+	if (blame->options.min_match_characters)
+		return blame->options.min_match_characters;
+
+	return BLAME_DEFAULT_MOVE_SCORE;
+}
+
+GIT_INLINE(const char *) blame_nth_line(git_blame *blame, size_t lno)
+{
+	size_t *offset = git_array_get(blame->line_index, lno);
+
+	GIT_ASSERT_WITH_RETVAL(offset, NULL);
+	return blame->final_buf + *offset;
+}
+
+/*
+ * The lines in blame_entry after splitting blames many times can become
+ * very small and trivial, and at some point it becomes pointless to
+ * blame the parents.  E.g. "\t\t}\n\t}\n\n" appears everywhere in any
+ * ordinary C program, and it is not worth to say it was copied from
+ * totally unrelated file in the parent.
+ *
+ * Compute how trivial the lines in the blame_entry are.  Only ASCII
+ * letters and digits count, whatever the locale.
+ *
+ * Ported from git.git's `ent_score` in builtin/blame.c at
+ * https://github.com/git/git/blob/35936f8fc38a214cc7d2595070641d39a541dfb1/builtin/blame.c#L806-L833
+ */
+static unsigned blame_entry_score(git_blame *blame, git_blame__entry *e)
+{
+	unsigned score;
+	const char *cp, *ep;
+
+	if (e->score)
+		return e->score;
+
+	score = 1;
+	cp = blame_nth_line(blame, e->lno);
+	ep = blame_nth_line(blame, e->lno + e->num_lines);
+	while (cp && ep && cp < ep) {
+		unsigned char ch = *((const unsigned char *)cp);
+		if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		    (ch >= '0' && ch <= '9'))
+			score++;
+		cp++;
+	}
+	e->score = score;
+	return score;
+}
+
+/*
+ * best_so_far[] and potential[] are both a split of an existing blame_entry
+ * that passes blame to the parent.  Maintain best_so_far the best split so
+ * far, by comparing potential and best_so_far and copying potential into
+ * best_so_far as needed.  A later split with the same score wins.
+ *
+ * Ported from git.git's `copy_split_if_better` in builtin/blame.c at
+ * https://github.com/git/git/blob/35936f8fc38a214cc7d2595070641d39a541dfb1/builtin/blame.c#L835-L859
+ */
+static void copy_split_if_better(
+		git_blame *blame,
+		git_blame__entry *best_so_far,
+		git_blame__entry *potential)
+{
+	int i;
+
+	if (!potential[1].suspect)
+		return;
+	if (best_so_far[1].suspect) {
+		if (blame_entry_score(blame, &potential[1]) <
+		    blame_entry_score(blame, &best_so_far[1]))
+			return;
+	}
+
+	for (i = 0; i < 3; i++)
+		origin_incref(potential[i].suspect);
+	decref_split(best_so_far);
+	memcpy(best_so_far, potential, sizeof(git_blame__entry[3]));
+}
+
+/*
+ * We are looking at a part of the final image represented by
+ * ent (tlno and same are offset by ent->s_lno).
+ * tlno is where we are looking at in the final image.
+ * up to (but not including) same match preimage.
+ * plno is where we are looking at in the preimage.
+ *
+ * <-------------- final image ---------------------->
+ *       <------ent------>
+ *         ^tlno ^same
+ *    <---------preimage----->
+ *         ^plno
+ *
+ * All line numbers are 0-based.
+ *
+ * Ported from git.git's `handle_split` in builtin/blame.c at
+ * https://github.com/git/git/blob/35936f8fc38a214cc7d2595070641d39a541dfb1/builtin/blame.c#L861-L892
+ */
+static void handle_split(
+		git_blame *blame,
+		git_blame__entry *ent,
+		size_t tlno,
+		size_t plno,
+		size_t same,
+		git_blame__origin *parent,
+		git_blame__entry *split)
+{
+	if (ent->num_lines <= tlno)
+		return;
+	if (tlno < same) {
+		git_blame__entry potential[3] = {{0}};
+		tlno += ent->s_lno;
+		same += ent->s_lno;
+		split_overlap(potential, ent, tlno, plno, same, parent);
+		copy_split_if_better(blame, split, potential);
+		decref_split(potential);
+	}
+}
+
+/*
+ * Ported from git.git's `handle_split_cb` in builtin/blame.c at
+ * https://github.com/git/git/blob/35936f8fc38a214cc7d2595070641d39a541dfb1/builtin/blame.c#L894-L912
+ */
+typedef struct handle_split_cb_data {
+	git_blame *blame;
+	git_blame__entry *ent;
+	git_blame__origin *parent;
+	git_blame__entry *split;
+	long plno;
+	long tlno;
+} handle_split_cb_data;
+
+static int handle_split_cb(
+	long start_a, long count_a,
+	long start_b, long count_b,
+	void *cb_data)
+{
+	handle_split_cb_data *d = (handle_split_cb_data *)cb_data;
+
+	handle_split(d->blame, d->ent, d->tlno, d->plno, start_b, d->parent,
+		     d->split);
+	d->plno = start_a + count_a;
+	d->tlno = start_b + count_b;
+
+	return 0;
+}
+
+/*
+ * Compare the lines of the final image that `ent` covers with the whole
+ * blob of `parent`, in `file_p`.  Every run of lines that the two have in
+ * common is a way to pass blame for some of the lines of `ent` to
+ * `parent`; store the split for the best one in `split`, which must be
+ * zeroed by the caller.  `split[1].suspect` stays NULL if the two have no
+ * line in common.
+ */
+static int find_copy_in_blob(
+		git_blame *blame,
+		git_blame__entry *ent,
+		git_blame__origin *parent,
+		git_blame__entry *split,
+		mmfile_t *file_p)
+{
+	handle_split_cb_data data = { 0 };
+	const char *first, *end;
+	mmfile_t file_o;
+
+	if ((first = blame_nth_line(blame, ent->lno)) == NULL ||
+	    (end = blame_nth_line(blame, ent->lno + ent->num_lines)) == NULL)
+		return -1;
+
+	file_o.ptr = (char *)first;
+	file_o.size = (long)(end - first);
+
+	data.blame = blame;
+	data.ent = ent;
+	data.parent = parent;
+	data.split = split;
+
+	if (diff_hunks(*file_p, file_o, handle_split_cb, &data,
+			&blame->options) < 0)
+		return -1;
+
+	/* The lines after the last difference are common, too. */
+	handle_split(blame, ent, data.tlno, data.plno, ent->num_lines,
+		parent, split);
+
+	return 0;
+}
+
+/*
+ * Find lines that `target` is still suspected for anywhere in the blob of
+ * `parent`, the same file in a parent commit: this detects lines that
+ * were moved or copied within the file.  An entry is split when a run of
+ * common lines scores above the move threshold; the parts of the entry
+ * that are left are searched again.
+ *
+ * Returns 1 when `target` is not suspected for any line, 0 when it
+ * still is, and a negative error code on failure.
+ */
+static int find_move_in_parent(
+		git_blame *blame,
+		git_blame__origin *target,
+		git_blame__origin *parent)
+{
+	unsigned threshold = blame_move_score(blame);
+	git_blame__entry *e, split[3];
+	size_t last_in_target;
+	mmfile_t file_p;
+	int error;
+
+	if (!find_last_in_target(&last_in_target, blame, target))
+		return 1;
+
+	fill_origin_blob(parent, &file_p);
+	if (!file_p.ptr)
+		return 0;
+
+	for (e = blame->ent; e; ) {
+		if (e->guilty || !same_suspect(e->suspect, target) ||
+		    blame_entry_score(blame, e) <= threshold) {
+			e = e->next;
+			continue;
+		}
+
+		memset(split, 0, sizeof(split));
+
+		error = find_copy_in_blob(blame, e, parent, split, &file_p);
+
+		if (!error && split[1].suspect &&
+		    blame_entry_score(blame, &split[1]) > threshold) {
+			/*
+			 * `e` now holds the part before the moved lines, or the
+			 * moved lines themselves.  Look at it again; the part
+			 * after them follows in the list.
+			 */
+			error = split_blame(blame, split, e);
+		} else {
+			e = e->next;
+		}
+
+		decref_split(split);
+
+		if (error < 0)
+			return error;
+	}
+
+	return 0;
+}
+
 static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 {
 	git_commit *commit = origin->commit;
@@ -1106,7 +1368,24 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 		}
 	}
 
-	/* TODO: optionally find moves in parents' files */
+	/*
+	 * Optionally find moves in parents' files.
+	 */
+	if (opt & GIT_BLAME_TRACK_COPIES_SAME_FILE) {
+		for (i = 0; i < num_parents; i++) {
+			if (!sg_origin[i])
+				continue;
+
+			ret = find_move_in_parent(blame, origin, sg_origin[i]);
+
+			if (ret != 0) {
+				if (ret < 0)
+					error = ret;
+
+				goto finish;
+			}
+		}
+	}
 
 	/* TODO: optionally find copies in parents' files */
 

@@ -1,6 +1,4 @@
-#include "clar_libgit2.h"
-
-#include "blame.h"
+#include "blame_helpers.h"
 
 
 /**
@@ -31,14 +29,39 @@ void test_blame_harder__cleanup(void)
 
 
 
+static void check_b_txt(git_blame *blame, bool copies)
+{
+	cl_assert_equal_i(4, git_blame_hunkcount(blame));
+
+	if (copies) {
+		check_blame_hunk_index(g_repo, blame, 0, 1, 4, 1,
+			"b99f7ac", "a.txt");
+		check_blame_hunk_index(g_repo, blame, 1, 5, 1, 1,
+			"b99f7ac", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 2, 6, 5, 1,
+			"b99f7ac", "a.txt");
+	} else {
+		check_blame_hunk_index(g_repo, blame, 0, 1, 4, 0,
+			"da23739", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 1, 5, 1, 1,
+			"b99f7ac", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 2, 6, 5, 0,
+			"63d671e", "b.txt");
+	}
+
+	check_blame_hunk_index(g_repo, blame, 3, 11, 5, 0, "aa06ecc", "b.txt");
+}
+
 void test_blame_harder__m(void)
 {
-	/* TODO */
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
+	/* No line of b.txt moved within b.txt. */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_FILE;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, false);
+	git_blame_free(blame);
 }
 
 

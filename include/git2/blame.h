@@ -34,9 +34,12 @@ typedef enum {
 	GIT_BLAME_NORMAL = 0,
 
 	/**
-	 * Track lines that have moved within a file (like `git blame -M`).
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * Track lines that have moved or been copied within a file (like
+	 * `git blame -M`).  When a commit changes a file, lines that it
+	 * seems to add are searched for anywhere in the parent's version
+	 * of the same file.  They are blamed on the parent when a match
+	 * has more than `min_match_characters` alphanumeric characters
+	 * (20 by default).
 	 */
 	GIT_BLAME_TRACK_COPIES_SAME_FILE = (1<<0),
 
@@ -101,8 +104,8 @@ typedef struct git_blame_options {
 	/**
 	 * The lower bound on the number of alphanumeric characters that
 	 * must be detected as moving/copying within a file for it to
-	 * associate those lines with the parent commit. The default value
-	 * is 20.
+	 * associate those lines with the parent commit.  Only ASCII letters
+	 * and digits count.  The default value is 20 (like `git blame -M`).
 	 *
 	 * This value only takes effect if any of the `GIT_BLAME_TRACK_COPIES_*`
 	 * flags are specified.

@@ -132,3 +132,35 @@ void test_blame_copies__inexact_rename_same_basename(void)
 	check_hunk(0, 1, 16, 0, "a604bc2", "bn/a/name.txt", 1);
 	check_hunk(1, 17, 4, 0, "c3d1cd1", "bn/b/name.txt", 17);
 }
+
+void test_blame_copies__move_within_file_needs_flag(void)
+{
+	blame("move.txt", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "move.txt", 1);
+	check_hunk(1, 4, 3, 1, "37495f8", "move.txt", 6);
+	check_hunk(2, 7, 2, 0, "3da1ad7", "move.txt", 7);
+}
+
+void test_blame_copies__move_within_file(void)
+{
+	blame("move.txt", GIT_BLAME_TRACK_COPIES_SAME_FILE, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "move.txt", 1);
+	check_hunk(1, 4, 3, 1, "37495f8", "move.txt", 6);
+	check_hunk(2, 7, 2, 1, "37495f8", "move.txt", 4);
+}
+
+void test_blame_copies__move_within_file_threshold(void)
+{
+	/* The moved block has 60 alphanumeric characters. */
+	blame("move.txt", GIT_BLAME_TRACK_COPIES_SAME_FILE, 60);
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(2, 7, 2, 1, "37495f8", "move.txt", 4);
+
+	blame("move.txt", GIT_BLAME_TRACK_COPIES_SAME_FILE, 61);
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(2, 7, 2, 0, "3da1ad7", "move.txt", 7);
+}
