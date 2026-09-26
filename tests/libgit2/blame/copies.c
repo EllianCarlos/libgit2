@@ -247,6 +247,32 @@ void test_blame_copies__copy_from_unmodified_file_needs_flag(void)
 	check_hunk(0, 1, 4, 0, "ddda373", "newcopy.txt", 1);
 }
 
+void test_blame_copies__copy_from_unmodified_file_to_new_file(void)
+{
+	blame("newcopy.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 1, 0, "ddda373", "newcopy.txt", 1);
+	check_hunk(1, 2, 2, 1, "37495f8", "library.txt", 2);
+	check_hunk(2, 4, 1, 0, "ddda373", "newcopy.txt", 4);
+}
+
+void test_blame_copies__copy_from_unmodified_file_to_existing_file(void)
+{
+	/* The file existed before, so only "any commit" copies find it. */
+	blame("existing.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "existing.txt", 1);
+	check_hunk(1, 4, 2, 0, "bbdd55f", "existing.txt", 4);
+
+	blame("existing.txt", GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 3, 1, "37495f8", "existing.txt", 1);
+	check_hunk(1, 4, 2, 1, "37495f8", "library.txt", 5);
+}
+
 void test_blame_copies__merge(void)
 {
 	blame("merge-b.txt", GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0);

@@ -53,18 +53,18 @@ typedef enum {
 	GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES = (1<<1),
 
 	/**
-	 * Track lines that have been copied from another file that exists
-	 * in the same commit (like `git blame -CC`).  Implies SAME_FILE.
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * In addition, when the commit creates the file (or renames it),
+	 * track lines that have been copied from any file of the parent
+	 * commit, modified or not (like `git blame -C -C`).  Implies
+	 * SAME_COMMIT_MOVES.
 	 */
 	GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES = (1<<2),
 
 	/**
-	 * Track lines that have been copied from another file that exists in
-	 * *any* commit (like `git blame -CCC`).  Implies SAME_COMMIT_COPIES.
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * In addition, for every commit that changes the file, track lines
+	 * that have been copied from any file of the parent commit,
+	 * modified or not (like `git blame -C -C -C`).  Implies
+	 * SAME_COMMIT_COPIES.
 	 */
 	GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES = (1<<3),
 

@@ -87,24 +87,30 @@ void test_blame_harder__c(void)
 
 void test_blame_harder__cc(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the second hunk in b.txt to (E), since it was copy/pasted from
-	 * a.txt in (C).
+	/*
+	 * The same as above: all the copies came from a.txt, which the
+	 * commits that copied them also modified.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	git_blame_free(blame);
 }
 
 void test_blame_harder__ccc(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the third hunk in b.txt to (E).  This hunk was deleted from
-	 * a.txt in (D), but reintroduced in (B).
+	/*
+	 * The fourth hunk in b.txt stays with (B): its lines are not in
+	 * any file of (D), the parent of (B), like `git blame -C -C -C`.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	git_blame_free(blame);
 }

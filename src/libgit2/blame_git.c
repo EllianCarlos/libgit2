@@ -1339,12 +1339,18 @@ static void clear_copy_candidates(blame_copy_candidates *candidates)
 /*
  * List the files of `parent` to search for copied lines: the files that
  * were modified or deleted between `parent` and the commit of `target`.
+ * To find copies harder, list the files that were not modified, too:
+ * always with `GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES`, and with
+ * `GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES` when the commit created or
+ * renamed the file of `target`.
  */
 static int diff_copy_sources(
 		git_diff **out,
 		git_blame *blame,
 		git_blame__origin *target,
-		git_commit *parent)
+		git_commit *parent,
+		git_blame__origin *porigin,
+		uint32_t opt)
 {
 	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
 	git_tree *otree = NULL, *ptree = NULL;
@@ -1352,6 +1358,11 @@ static int diff_copy_sources(
 
 	diffopts.context_lines = 0;
 	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK;
+
+	if ((opt & GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES) ||
+	    ((opt & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES) &&
+	     (!porigin || strcmp(target->path, porigin->path))))
+		diffopts.flags |= GIT_DIFF_INCLUDE_UNMODIFIED;
 
 	if ((error = git_commit_tree(&otree, target->commit)) < 0 ||
 	    (error = git_commit_tree(&ptree, parent)) < 0)
@@ -1474,7 +1485,8 @@ static int find_copy_in_parent(
 		git_blame *blame,
 		git_blame__origin *target,
 		git_commit *parent,
-		git_blame__origin *porigin)
+		git_blame__origin *porigin,
+		uint32_t opt)
 {
 	blame_copy_candidates candidates = GIT_ARRAY_INIT, next = GIT_ARRAY_INIT;
 	unsigned threshold = blame_copy_score(blame);
@@ -1496,7 +1508,8 @@ static int find_copy_in_parent(
 		goto done;
 	}
 
-	if ((error = diff_copy_sources(&diff, blame, target, parent)) < 0)
+	if ((error = diff_copy_sources(&diff, blame, target, parent,
+			porigin, opt)) < 0)
 		goto done;
 
 	while (git_array_size(candidates)) {
@@ -1672,7 +1685,8 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 			if ((error = git_commit_parent(&p, commit, i)) < 0)
 				goto finish;
 
-			ret = find_copy_in_parent(blame, origin, p, sg_origin[i]);
+			ret = find_copy_in_parent(blame, origin, p,
+				sg_origin[i], opt);
 			git_commit_free(p);
 
 			if (ret != 0) {
