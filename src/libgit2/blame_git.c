@@ -459,6 +459,9 @@ static int diff_hunks(mmfile_t file_a, mmfile_t file_b, void *cb_data, git_blame
 	xdemitcb_t ecb = {0};
 	xpparam_t xpp = {0};
 
+	/* git blame uses the indent heuristic by default. */
+	xpp.flags = XDF_INDENT_HEURISTIC;
+
 	if (options->flags & GIT_BLAME_IGNORE_WHITESPACE)
 		xpp.flags |= XDF_IGNORE_WHITESPACE;
 

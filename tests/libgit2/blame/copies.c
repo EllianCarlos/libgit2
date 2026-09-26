@@ -79,6 +79,17 @@ static void check_hunk(
 		git_blame_hunk_byindex(g_blame, idx)->orig_start_line_number);
 }
 
+void test_blame_copies__indent_heuristic(void)
+{
+	/* Like git, the added lines are "a", "", "b", not "", "b", "a". */
+	blame("indent.txt", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(3, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 4, 1, "37495f8", "indent.txt", 1);
+	check_hunk(1, 5, 3, 0, "52bb6a6", "indent.txt", 5);
+	check_hunk(2, 8, 3, 1, "37495f8", "indent.txt", 5);
+}
+
 void test_blame_copies__exact_rename_with_several_sources(void)
 {
 	/*
