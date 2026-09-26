@@ -45,6 +45,17 @@ static double prof_now(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+static size_t prof_prune_violations;
+
+/* GIT_BLAME_CHECK_PRUNE=1: run xdiff for each skipped source, too. */
+static int prof_check_prune(void)
+{
+	static int v = -1;
+	if (v < 0)
+		v = getenv("GIT_BLAME_CHECK_PRUNE") != NULL;
+	return v;
+}
+
 static FILE *prof_log(void)
 {
 	static FILE *f;
@@ -1334,15 +1345,24 @@ static int find_copy_in_blob(
 /* The line filters of the copy search; see git_blame_cache below. */
 
 #define BLAME_CACHE_DEFAULT_BYTES ((size_t)512 * 1024 * 1024)
-#define BLAME_FILTER_BITS_PER_ITEM 8
+#define BLAME_FILTER_BITS_PER_ITEM 10
 #define BLAME_FILTER_MIN_BITS 64
+
+/*
+ * The filter has a single line only when the line scores above this;
+ * so the filter can prove a bound only for a threshold of this or more.
+ * Most lines of a tokenized file score less, and a filter without them
+ * is smaller.
+ */
+#define BLAME_FILTER_LINE_SCORE 16
 
 typedef struct {
 	git_oid id;
 	uint16_t mode;
 	bool filtered;   /* `bits` is valid */
 	bool no_filter;  /* never make a filter for this source */
-	uint32_t mask;   /* the number of bits in `bits`, minus 1 */
+	uint32_t nbits;  /* the number of bits in `bits` */
+	uint64_t salt;   /* makes the bits of each filter different */
 	unsigned char *bits;
 	char *path;
 } blame_source;
@@ -1396,22 +1416,46 @@ GIT_INLINE(uint64_t) blame_item_pair(uint64_t a, uint64_t b)
 	return blame_mix(a * UINT64_C(0x9e3779b97f4a7c15) + b);
 }
 
+/* Map 32 random bits to a bit of the filter, without a division. */
+GIT_INLINE(uint32_t) blame_filter_bit(const blame_source *s, uint32_t x)
+{
+	return (uint32_t)(((uint64_t)x * s->nbits) >> 32);
+}
+
+/* Three probes for each item, by double hashing. */
+#define BLAME_FILTER_PROBES 3
+
+/*
+ * Most sources of a big commit have most of their lines in common (they
+ * are generated).  Without a salt, a line that is a false positive in
+ * one filter would be a false positive in all of them, because the same
+ * common lines set the same bits.  A salt for each filter makes the
+ * false positives of different filters independent.
+ */
 GIT_INLINE(void) blame_filter_set(blame_source *s, uint64_t item)
 {
-	uint32_t b1 = (uint32_t)item & s->mask;
-	uint32_t b2 = (uint32_t)(item >> 32) & s->mask;
+	uint64_t x = blame_mix(item ^ s->salt);
+	uint32_t h1 = (uint32_t)x, h2 = (uint32_t)(x >> 32) | 1;
+	int i;
 
-	s->bits[b1 >> 3] |= (unsigned char)(1 << (b1 & 7));
-	s->bits[b2 >> 3] |= (unsigned char)(1 << (b2 & 7));
+	for (i = 0; i < BLAME_FILTER_PROBES; i++, h1 += h2) {
+		uint32_t b = blame_filter_bit(s, h1);
+		s->bits[b >> 3] |= (unsigned char)(1 << (b & 7));
+	}
 }
 
 GIT_INLINE(bool) blame_filter_test(const blame_source *s, uint64_t item)
 {
-	uint32_t b1 = (uint32_t)item & s->mask;
-	uint32_t b2 = (uint32_t)(item >> 32) & s->mask;
+	uint64_t x = blame_mix(item ^ s->salt);
+	uint32_t h1 = (uint32_t)x, h2 = (uint32_t)(x >> 32) | 1;
+	int i;
 
-	return (s->bits[b1 >> 3] & (1 << (b1 & 7))) &&
-	       (s->bits[b2 >> 3] & (1 << (b2 & 7)));
+	for (i = 0; i < BLAME_FILTER_PROBES; i++, h1 += h2) {
+		uint32_t b = blame_filter_bit(s, h1);
+		if (!(s->bits[b >> 3] & (1 << (b & 7))))
+			return false;
+	}
+	return true;
 }
 
 static int blame_u64_cmp(const void *a, const void *b)
@@ -1427,10 +1471,12 @@ static int blame_u64_cmp(const void *a, const void *b)
  */
 static int blame_hash_lines(
 		uint64_t **out,
+		unsigned **scores_out,
 		size_t *count,
 		const char *buf,
 		size_t size)
 {
+	unsigned *sc = NULL;
 	const char *p = buf, *end = buf + size, *nl;
 	size_t n = 0, alloc = 0;
 	uint64_t *h = NULL;
@@ -1444,17 +1490,34 @@ static int blame_hash_lines(
 	alloc++;
 
 	h = git__mallocarray(alloc, sizeof(uint64_t));
-	GIT_ERROR_CHECK_ALLOC(h);
+	sc = git__mallocarray(alloc, sizeof(unsigned));
+	if (!h || !sc) {
+		git__free(h);
+		git__free(sc);
+		git_error_set_oom();
+		return -1;
+	}
 
 	while (p < end) {
+		const char *q;
+		unsigned score = 0;
+
 		nl = memchr(p, '\n', (size_t)(end - p));
 		if (!nl)
 			nl = end;
+		for (q = p; q < nl; q++) {
+			unsigned char ch = *((const unsigned char *)q);
+			if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			    (ch >= '0' && ch <= '9'))
+				score++;
+		}
+		sc[n] = score;
 		h[n++] = blame_line_hash(p, (size_t)(nl - p));
 		p = nl + 1;
 	}
 
 	*out = h;
+	*scores_out = sc;
 	*count = n;
 	return 0;
 }
@@ -1466,21 +1529,24 @@ static int blame_filter_build(
 		size_t size)
 {
 	uint64_t *h = NULL, *items = NULL;
+	unsigned *sc = NULL;
 	size_t n, nitems = 0, distinct, i, nbits;
 	int error;
 
-	if ((error = blame_hash_lines(&h, &n, buf, size)) < 0)
+	if ((error = blame_hash_lines(&h, &sc, &n, buf, size)) < 0)
 		return error;
 
 	items = git__mallocarray(n * 2 + 1, sizeof(uint64_t));
 	if (!items) {
 		git__free(h);
+		git__free(sc);
 		git_error_set_oom();
 		return -1;
 	}
 
 	for (i = 0; i < n; i++) {
-		items[nitems++] = blame_item_line(h[i]);
+		if (1 + sc[i] > BLAME_FILTER_LINE_SCORE)
+			items[nitems++] = blame_item_line(h[i]);
 		if (i > 0)
 			items[nitems++] = blame_item_pair(h[i - 1], h[i]);
 	}
@@ -1490,25 +1556,28 @@ static int blame_filter_build(
 		if (!i || items[i] != items[i - 1])
 			items[distinct++] = items[i];
 
-	for (nbits = BLAME_FILTER_MIN_BITS;
-	     nbits < distinct * BLAME_FILTER_BITS_PER_ITEM &&
-	     nbits < ((size_t)1 << 31);
-	     nbits <<= 1)
-		;
+	nbits = distinct * BLAME_FILTER_BITS_PER_ITEM;
+	if (nbits < BLAME_FILTER_MIN_BITS)
+		nbits = BLAME_FILTER_MIN_BITS;
+	if (nbits > ((size_t)1 << 31))
+		nbits = (size_t)1 << 31;
+	nbits = (nbits + 7) & ~(size_t)7;
 
 	s->bits = git__calloc(nbits / 8, 1);
 	if (!s->bits) {
 		git__free(h);
+		git__free(sc);
 		git__free(items);
 		return -1;
 	}
-	s->mask = (uint32_t)(nbits - 1);
+	s->nbits = (uint32_t)nbits;
 
 	for (i = 0; i < distinct; i++)
 		blame_filter_set(s, items[i]);
 
 	s->filtered = true;
 	git__free(h);
+	git__free(sc);
 	git__free(items);
 	return 0;
 }
@@ -1576,7 +1645,9 @@ static void blame_entry_lines_free(blame_entry_lines *l)
  * Each line of a run of two or more lines is in `s` together with the
  * line after it, and a run of one line is in `s`.  So the best score of
  * a run in which each pair of lines is in the filter, and of a single
- * line that is in the filter, is an upper bound.
+ * line that is in the filter, is an upper bound.  The filter has a
+ * single line only if it scores above BLAME_FILTER_LINE_SCORE; thus for
+ * a lower threshold the answer is always "can match".
  */
 static bool blame_source_can_match(
 		const blame_source *s,
@@ -1585,6 +1656,9 @@ static bool blame_source_can_match(
 {
 	size_t k, run_len = 0;
 	unsigned long run = 0;
+
+	if (threshold < BLAME_FILTER_LINE_SCORE)
+		return true;
 
 	for (k = 0; k < l->count; k++) {
 		if (k > 0 && run_len > 0 &&
@@ -1669,6 +1743,20 @@ static int find_move_in_parent(
 			blame->cache->stats.source_checks++;
 			if (!can_match) {
 				blame->cache->stats.source_pruned++;
+#ifdef GIT_BLAME_PROFILE
+				if (prof_check_prune()) {
+					memset(split, 0, sizeof(split));
+					if (find_copy_in_blob(blame, e, parent, split,
+							&file_p) == 0 && split[1].suspect &&
+					    blame_entry_score(blame, &split[1]) > threshold) {
+						prof_prune_violations++;
+						fprintf(stderr, "PRUNE VIOLATION (move) %s lno=%zu n=%zu score=%u\n",
+							parent->path, e->lno, e->num_lines,
+							blame_entry_score(blame, &split[1]));
+					}
+					decref_split(split);
+				}
+#endif
 				e = e->next;
 				continue;
 			}
@@ -2115,6 +2203,7 @@ static int find_best_copies_in_list(
 					s->no_filter = true;
 					cache->stats.filters_skipped++;
 				} else {
+					memcpy(&s->salt, s->id.id, sizeof(s->salt));
 					PROF_START();
 					error = blame_filter_build(s,
 						git_blob_rawcontent(blob),
@@ -2124,8 +2213,8 @@ static int find_best_copies_in_list(
 						git_blob_free(blob);
 						goto done;
 					}
-					list->bytes += (size_t)s->mask / 8 + 1;
-					cache->stats.bytes += (size_t)s->mask / 8 + 1;
+					list->bytes += (size_t)s->nbits / 8;
+					cache->stats.bytes += (size_t)s->nbits / 8;
 					cache->stats.filters_built++;
 				}
 			}
@@ -2134,9 +2223,44 @@ static int find_best_copies_in_list(
 		git_array_foreach(*candidates, j, c) {
 			cache->stats.source_checks++;
 
+#ifdef GIT_BLAME_PROFILE
+			if (prune && s->filtered && getenv("GIT_BLAME_DUMP_PRUNE")) {
+				char hx[GIT_OID_MAX_HEXSIZE + 1];
+				git_oid_tostr(hx, sizeof(hx), &s->id);
+				fprintf(stderr, "D %s %zu %zu %d\n", hx, c->ent->lno,
+					c->ent->num_lines,
+					(int)blame_source_can_match(s, &lines[j], threshold));
+			}
+#endif
 			if (prune && s->filtered &&
 			    !blame_source_can_match(s, &lines[j], threshold)) {
 				cache->stats.source_pruned++;
+#ifdef GIT_BLAME_PROFILE
+				if (prof_check_prune()) {
+					git_blame__origin *o = NULL;
+					git_commit *pc = NULL;
+					git_blob *pb = NULL;
+					mmfile_t fp;
+
+					memset(potential, 0, sizeof(potential));
+					if (git_commit_dup(&pc, parent) == 0 &&
+					    git_blob_lookup(&pb, blame->repository, &s->id) == 0 &&
+					    new_origin(&o, pc, pb, s->path, s->mode) == 0) {
+						fill_origin_blob(o, &fp);
+						if (find_copy_in_blob(blame, c->ent, o,
+								potential, &fp) == 0 &&
+						    potential[1].suspect &&
+						    blame_entry_score(blame, &potential[1]) > threshold) {
+							prof_prune_violations++;
+							fprintf(stderr, "PRUNE VIOLATION (copy) %s lno=%zu n=%zu score=%u\n",
+								s->path, c->ent->lno, c->ent->num_lines,
+								blame_entry_score(blame, &potential[1]));
+						}
+						decref_split(potential);
+						origin_decref(o);
+					}
+				}
+#endif
 				continue;
 			}
 
@@ -2620,10 +2744,10 @@ int git_blame__like_git(git_blame *blame, uint32_t opt)
 		fprintf(prof_log(), " copy_searches=%zu copy_deltas=%zu"
 			" copy_sources=%zu copy_bytes=%zu copy_xdiffs=%zu"
 			" copy_useful=%zu rename_inexact=%zu rename_srcs=%zu"
-			" rename_bytes=%zu\n", prof_copy_searches,
+			" rename_bytes=%zu prune_violations=%zu\n", prof_copy_searches,
 			prof_copy_deltas, prof_copy_sources, prof_copy_bytes,
 			prof_copy_xdiffs, prof_copy_useful, prof_rename_inexact,
-			prof_rename_srcs, prof_rename_bytes);
+			prof_rename_srcs, prof_rename_bytes, prof_prune_violations);
 		fflush(prof_log());
 	}
 #endif
