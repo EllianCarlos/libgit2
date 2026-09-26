@@ -2266,11 +2266,11 @@ void git_blame__cache_merge_counts(git_blame *blame)
  *
  * find_best_copies_in_diff keeps, for each candidate, the split with
  * the highest score, and of those the one of the last source (a later
- * split with the same score wins).  Here each candidate looks at the
- * sources in the same order, and skips a source when the filter proves
- * that it cannot give a split above the threshold, or a split that
- * scores at least as high as the best split so far.  So the result is
- * the same.
+ * split with the same score wins).  Here the search skips a (candidate,
+ * source) pair when the filter proves that the source cannot give a
+ * split above the threshold, or a split that scores at least as high as
+ * the best split of the candidate so far.  The sources come in the same
+ * order, so the result is the same.
  */
 static int find_best_copies_in_list(
 		git_blame *blame,
@@ -2281,62 +2281,73 @@ static int find_best_copies_in_list(
 {
 	unsigned threshold = blame_copy_score(blame);
 	bool prune = !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE);
+	blame_entry_lines *lines = NULL;
+	unsigned *best = NULL;
 	git_blame__entry potential[3];
 	blame_copy_candidate *c;
-	size_t i, j;
+	size_t i, j, ncand = git_array_size(*candidates);
 	int error = 0;
 	PROF_VARS;
 
-	git_array_foreach(*candidates, j, c) {
-		blame_entry_lines lines;
-		unsigned best_score = 0;
-
-		memset(&lines, 0, sizeof(lines));
-		if (prune && (error = blame_entry_lines_init(&lines, blame,
-				c->ent)) < 0) {
-			blame_entry_lines_free(&lines);
-			goto done;
+	lines = git__calloc(ncand ? ncand : 1, sizeof(*lines));
+	best = git__calloc(ncand ? ncand : 1, sizeof(*best));
+	if (!lines || !best) {
+		error = -1;
+		goto done;
+	}
+	if (prune) {
+		git_array_foreach(*candidates, j, c) {
+			if ((error = blame_entry_lines_init(&lines[j], blame,
+					c->ent)) < 0)
+				goto done;
 		}
+	}
 
-		for (i = 0; i < list->count; i++) {
-			const blame_source *s = &list->sources[i];
-			git_blame__origin *norigin = NULL;
-			git_commit *commit = NULL;
-			git_blob *blob = NULL;
+	for (i = 0; i < list->count; i++) {
+		const blame_source *s = &list->sources[i];
+		git_blame__origin *norigin = NULL;
+		mmfile_t file_p;
+
+		if (porigin && !strcmp(s->path, porigin->path))
+			continue;
+
+		git_array_foreach(*candidates, j, c) {
 			unsigned bar = threshold;
-			mmfile_t file_p;
-
-			if (porigin && !strcmp(s->path, porigin->path))
-				continue;
 
 			/* A later split with the same score wins: keep a tie. */
-			if (c->split[1].suspect && best_score > bar)
-				bar = best_score - 1;
+			if (c->split[1].suspect && best[j] > bar)
+				bar = best[j] - 1;
 
 			blame->cache_counts.checks++;
 			if (prune && s->filtered &&
-			    !blame_source_can_match(s, &lines, bar)) {
+			    !blame_source_can_match(s, &lines[j], bar)) {
 				blame->cache_counts.pruned++;
 				continue;
 			}
 
-			PROF_START();
-			error = git_blob_lookup(&blob, blame->repository, &s->id);
-			PROF_STOP(P_COPY_LOAD);
-			if (error < 0)
-				break;
-			blame->cache_counts.blob_loads++;
-			PROF_COUNT(prof_copy_sources, 1);
-			PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
+			if (!norigin) {
+				git_commit *commit = NULL;
+				git_blob *blob = NULL;
 
-			if ((error = git_commit_dup(&commit, parent)) < 0 ||
-			    (error = new_origin(&norigin, commit, blob,
-					s->path, s->mode)) < 0) {
-				git_commit_free(commit);
-				git_blob_free(blob);
-				break;
+				PROF_START();
+				error = git_blob_lookup(&blob,
+					blame->repository, &s->id);
+				PROF_STOP(P_COPY_LOAD);
+				if (error < 0)
+					break;
+				blame->cache_counts.blob_loads++;
+				PROF_COUNT(prof_copy_sources, 1);
+				PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
+
+				if ((error = git_commit_dup(&commit, parent)) < 0 ||
+				    (error = new_origin(&norigin, commit, blob,
+						s->path, s->mode)) < 0) {
+					git_commit_free(commit);
+					git_blob_free(blob);
+					break;
+				}
+				fill_origin_blob(norigin, &file_p);
 			}
-			fill_origin_blob(norigin, &file_p);
 
 			memset(potential, 0, sizeof(potential));
 			blame->cache_counts.xdiffs++;
@@ -2348,35 +2359,41 @@ static int find_best_copies_in_list(
 			PROF_COUNT(prof_copy_xdiffs, 1);
 
 			if (error == 0 && potential[1].suspect) {
+#ifdef GIT_BLAME_PROFILE
 				unsigned score = blame_entry_score(blame,
 					&potential[1]);
-#ifdef GIT_BLAME_PROFILE
 				if (score > threshold)
 					prof_copy_useful++;
 				if (prune && s->filtered && score > bar &&
-				    !blame_source_can_match(s, &lines, score - 1)) {
+				    !blame_source_can_match(s, &lines[j], score - 1)) {
 					prof_prune_violations++;
 					fprintf(stderr, "BOUND VIOLATION %s score=%u\n",
 						s->path, score);
 				}
 #endif
 				copy_split_if_better(blame, c->split, potential);
-				best_score = blame_entry_score(blame, &c->split[1]);
+				best[j] = blame_entry_score(blame, &c->split[1]);
 			}
 
 			decref_split(potential);
-			origin_decref(norigin);
 
 			if (error < 0)
 				break;
 		}
 
-		blame_entry_lines_free(&lines);
+		origin_decref(norigin);
+
 		if (error < 0)
 			goto done;
 	}
 
 done:
+	if (lines) {
+		for (j = 0; j < ncand; j++)
+			blame_entry_lines_free(&lines[j]);
+	}
+	git__free(lines);
+	git__free(best);
 	return error;
 }
 
