@@ -518,7 +518,9 @@ int git_blame_file_cached(
 	if ((error = load_blob(blame)) < 0)
 		goto on_error;
 
-	if ((error = blame_internal(blame)) < 0)
+	error = blame_internal(blame);
+	git_blame__cache_merge_counts(blame);
+	if (error < 0)
 		goto on_error;
 
 	*out = blame;

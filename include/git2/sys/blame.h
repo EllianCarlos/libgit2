@@ -37,7 +37,7 @@ typedef struct {
 	size_t list_misses;      /**< copy searches that made their list */
 	size_t list_evictions;   /**< lists removed to stay in the limit */
 	size_t filters_built;    /**< line filters made from blobs */
-	size_t filters_skipped;  /**< sources without a filter (no memory) */
+	size_t filters_skipped;  /**< unused; always 0 */
 	size_t source_checks;    /**< (entry, source) pairs looked at */
 	size_t source_pruned;    /**< pairs that the filter proved empty */
 	size_t source_xdiffs;    /**< pairs that were compared with xdiff */
@@ -45,8 +45,13 @@ typedef struct {
 } git_blame_cache_stats;
 
 /**
- * Create a cache for the blames of `repo`.  The cache must not outlive
- * the repository, and only one thread can use it at a time.
+ * Create a cache for the blames of `repo`.  Many threads can share the
+ * cache, each with its own `git_repository` object for the same
+ * repository.
+ *
+ * The limit is soft: the cache removes the lists that no blame uses,
+ * least recently used first, but it keeps a new list even when that
+ * list alone is above the limit.
  *
  * @param out the new cache
  * @param repo the repository

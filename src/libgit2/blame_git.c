@@ -1371,14 +1371,24 @@ typedef struct {
 	char *key;
 	blame_source *sources;
 	size_t count;
+	size_t filters;
 	size_t bytes;
 	uint64_t last_use;
+	int refcount;   /* blames that use the list now */
+	bool ready;     /* made; before that, other blames wait */
 } blame_source_list;
 
 GIT_HASHMAP_STR_SETUP(blame_source_listmap, blame_source_list *);
 
+/*
+ * The lock protects the map, the counters, and the refcount and state
+ * of each list.  A list that is ready does not change until it is freed,
+ * so a blame reads it without the lock.
+ */
 struct git_blame_cache {
 	git_repository *repo;
+	git_mutex lock;
+	git_cond ready;
 	blame_source_listmap lists;
 	uint64_t clock;
 	git_blame_cache_stats stats;
@@ -1740,9 +1750,9 @@ static int find_move_in_parent(
 			can_match = blame_source_can_match(&filter, &lines,
 				threshold);
 			blame_entry_lines_free(&lines);
-			blame->cache->stats.source_checks++;
+			blame->cache_counts.checks++;
 			if (!can_match) {
-				blame->cache->stats.source_pruned++;
+				blame->cache_counts.pruned++;
 #ifdef GIT_BLAME_PROFILE
 				if (prof_check_prune()) {
 					memset(split, 0, sizeof(split));
@@ -1760,7 +1770,7 @@ static int find_move_in_parent(
 				e = e->next;
 				continue;
 			}
-			blame->cache->stats.source_xdiffs++;
+			blame->cache_counts.xdiffs++;
 		}
 
 		memset(split, 0, sizeof(split));
@@ -2016,15 +2026,19 @@ static void blame_source_list_free(blame_source_list *list)
 	git__free(list);
 }
 
-/* Remove the least recently used list other than `keep`. */
-static bool blame_cache_evict(git_blame_cache *cache, blame_source_list *keep)
+/*
+ * Remove the least recently used list that no blame uses now.  The
+ * caller holds the lock.
+ */
+static bool blame_cache_evict(git_blame_cache *cache)
 {
 	git_hashmap_iter_t iter = GIT_HASHMAP_ITER_INIT;
 	blame_source_list *list, *lru = NULL;
 
 	while (blame_source_listmap_iterate(&iter, NULL, &list,
 			&cache->lists) == 0) {
-		if (list != keep && (!lru || list->last_use < lru->last_use))
+		if (list->ready && !list->refcount &&
+		    (!lru || list->last_use < lru->last_use))
 			lru = list;
 	}
 
@@ -2039,22 +2053,99 @@ static bool blame_cache_evict(git_blame_cache *cache, blame_source_list *keep)
 	return true;
 }
 
-/* Make room for `bytes` more bytes, if possible, keeping `keep`. */
-static bool blame_cache_reserve(
-		git_blame_cache *cache,
-		blame_source_list *keep,
-		size_t bytes)
+/*
+ * Make the list of sources, and the filter of each source: read every
+ * blob once.  This runs without the lock; `list` is not visible to
+ * other blames yet.
+ */
+static int blame_source_list_build(
+		blame_source_list *list,
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent,
+		git_blame__origin *porigin,
+		uint32_t opt,
+		bool filters)
 {
-	while (cache->stats.bytes + bytes > cache->stats.max_bytes)
-		if (!blame_cache_evict(cache, keep))
-			return false;
-	return true;
+	git_diff *diff = NULL;
+	size_t i;
+	int error;
+	PROF_VARS;
+
+	if ((error = diff_copy_sources(&diff, blame, target, parent,
+			porigin, opt)) < 0)
+		return error;
+
+	list->sources = git__calloc(git_diff_num_deltas(diff) + 1,
+		sizeof(blame_source));
+	if (!list->sources) {
+		error = -1;
+		goto done;
+	}
+	list->bytes = sizeof(*list) + strlen(list->key) + 1 +
+		sizeof(blame_source);
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+		blame_source *s;
+		git_blob *blob = NULL;
+
+		if (!is_copy_source(delta, NULL))
+			continue;
+
+		s = &list->sources[list->count];
+		git_oid_cpy(&s->id, &delta->old_file.id);
+		s->mode = delta->old_file.mode;
+		if ((s->path = git__strdup(delta->old_file.path)) == NULL) {
+			error = -1;
+			goto done;
+		}
+		list->count++;
+		list->bytes += sizeof(*s) + strlen(s->path) + 1;
+
+		if (!filters) {
+			s->no_filter = true;
+			continue;
+		}
+
+		PROF_START();
+		error = git_blob_lookup(&blob, blame->repository, &s->id);
+		PROF_STOP(P_COPY_LOAD);
+		if (error < 0)
+			goto done;
+		blame->cache_counts.blob_loads++;
+		PROF_COUNT(prof_copy_sources, 1);
+		PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
+
+		if (git_blob_rawsize(blob) > GIT_XDIFF_MAX_SIZE) {
+			s->no_filter = true;
+		} else {
+			memcpy(&s->salt, s->id.id, sizeof(s->salt));
+			PROF_START();
+			error = blame_filter_build(s, git_blob_rawcontent(blob),
+				(size_t)git_blob_rawsize(blob));
+			PROF_STOP(P_FILTER);
+			if (error < 0) {
+				git_blob_free(blob);
+				goto done;
+			}
+			list->bytes += (size_t)s->nbits / 8;
+			list->filters++;
+		}
+		git_blob_free(blob);
+	}
+
+done:
+	git_diff_free(diff);
+	return error;
 }
 
 /*
  * Get the list of the copy sources of `target` in `parent`, the same
- * files as `diff_copy_sources` lists, in the same order.  The list does
- * not leave out the file of `porigin`; the caller does.
+ * files as `diff_copy_sources` lists, in the same order, and hold it
+ * until blame_cache_release.  The list does not leave out the file of
+ * `porigin`; the caller does.  When another blame makes the same list
+ * at the same time, wait for it.
  */
 static int blame_cache_sources(
 		blame_source_list **out,
@@ -2065,10 +2156,10 @@ static int blame_cache_sources(
 		uint32_t opt)
 {
 	git_blame_cache *cache = blame->cache;
-	char key[GIT_OID_MAX_HEXSIZE * 2 + 4];
+	bool filters = !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE);
+	char key[GIT_OID_MAX_HEXSIZE * 2 + 5];
 	blame_source_list *list = NULL;
-	git_diff *diff = NULL;
-	size_t i, n;
+	size_t n;
 	int unmodified, error;
 
 	unmodified = (opt & GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES) ||
@@ -2083,70 +2174,96 @@ static int blame_cache_sources(
 	n = strlen(key);
 	key[n++] = ' ';
 	key[n++] = unmodified ? 'u' : 'm';
+	key[n++] = filters ? 'f' : 'n';
 	key[n] = '\0';
 
-	if (blame_source_listmap_get(&list, &cache->lists, key) == 0) {
-		list->last_use = ++cache->clock;
-		cache->stats.list_hits++;
-		*out = list;
-		return 0;
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return -1;
 	}
 
-	if ((error = diff_copy_sources(&diff, blame, target, parent,
-			porigin, opt)) < 0)
-		return error;
-
-	list = git__calloc(1, sizeof(*list));
-	GIT_ERROR_CHECK_ALLOC(list);
-	list->key = git__strdup(key);
-	list->sources = git__calloc(git_diff_num_deltas(diff) + 1,
-		sizeof(blame_source));
-	if (!list->key || !list->sources) {
-		error = -1;
-		goto done;
-	}
-	list->bytes = sizeof(*list) + strlen(key) + 1;
-
-	for (i = 0; i < git_diff_num_deltas(diff); i++) {
-		const git_diff_delta *delta = git_diff_get_delta(diff, i);
-		blame_source *s;
-
-		if (!is_copy_source(delta, NULL))
-			continue;
-
-		s = &list->sources[list->count];
-		git_oid_cpy(&s->id, &delta->old_file.id);
-		s->mode = delta->old_file.mode;
-		if ((s->path = git__strdup(delta->old_file.path)) == NULL) {
-			error = -1;
-			goto done;
+	while (blame_source_listmap_get(&list, &cache->lists, key) == 0) {
+		if (list->ready) {
+			list->refcount++;
+			list->last_use = ++cache->clock;
+			cache->stats.list_hits++;
+			git_mutex_unlock(&cache->lock);
+			*out = list;
+			return 0;
 		}
-		list->count++;
-		list->bytes += sizeof(*s) + strlen(s->path) + 1;
+		/* Another blame makes this list now. */
+		git_cond_wait(&cache->ready, &cache->lock);
 	}
-	list->bytes += sizeof(blame_source);
 
-	/* The list itself stays in the cache, even above the limit. */
-	blame_cache_reserve(cache, NULL, list->bytes);
+	/* Make the list; other blames that want it wait. */
+	list = git__calloc(1, sizeof(*list));
+	if (!list || (list->key = git__strdup(key)) == NULL ||
+	    blame_source_listmap_put(&cache->lists, list->key, list) < 0) {
+		if (list)
+			git__free(list->key);
+		git__free(list);
+		git_mutex_unlock(&cache->lock);
+		git_error_set_oom();
+		return -1;
+	}
+	git_mutex_unlock(&cache->lock);
 
-	if ((error = blame_source_listmap_put(&cache->lists, list->key,
-			list)) < 0)
-		goto done;
+	error = blame_source_list_build(list, blame, target, parent, porigin,
+		opt, filters);
 
-	cache->stats.bytes += list->bytes;
-	cache->stats.lists++;
-	cache->stats.list_misses++;
-	list->last_use = ++cache->clock;
+	git_mutex_lock(&cache->lock);
+	if (error < 0) {
+		blame_source_listmap_remove(&cache->lists, list->key);
+		blame_source_list_free(list);
+		list = NULL;
+	} else {
+		/* The new list stays, even when it alone is above the limit. */
+		while (cache->stats.bytes + list->bytes > cache->stats.max_bytes &&
+		       blame_cache_evict(cache))
+			;
+		list->ready = true;
+		list->refcount = 1;
+		list->last_use = ++cache->clock;
+		cache->stats.bytes += list->bytes;
+		cache->stats.lists++;
+		cache->stats.list_misses++;
+		cache->stats.filters_built += list->filters;
+	}
+	git_cond_broadcast(&cache->ready);
+	git_mutex_unlock(&cache->lock);
+
 	*out = list;
-	list = NULL;
-
-done:
-	blame_source_list_free(list);
-	git_diff_free(diff);
 	return error;
 }
 
-/* Like find_best_copies_in_diff, for a list from the cache. */
+static void blame_cache_release(git_blame_cache *cache, blame_source_list *list)
+{
+	if (!list)
+		return;
+	git_mutex_lock(&cache->lock);
+	list->refcount--;
+	git_mutex_unlock(&cache->lock);
+}
+
+void git_blame__cache_merge_counts(git_blame *blame)
+{
+	git_blame_cache *cache = blame->cache;
+
+	if (!cache)
+		return;
+	git_mutex_lock(&cache->lock);
+	cache->stats.source_checks += blame->cache_counts.checks;
+	cache->stats.source_pruned += blame->cache_counts.pruned;
+	cache->stats.source_xdiffs += blame->cache_counts.xdiffs;
+	cache->stats.blob_loads += blame->cache_counts.blob_loads;
+	git_mutex_unlock(&cache->lock);
+	memset(&blame->cache_counts, 0, sizeof(blame->cache_counts));
+}
+
+/*
+ * Like find_best_copies_in_diff, for a list from the cache.  The list
+ * is read only here, so blames in other threads can use it too.
+ */
 static int find_best_copies_in_list(
 		git_blame *blame,
 		blame_copy_candidates *candidates,
@@ -2154,7 +2271,6 @@ static int find_best_copies_in_list(
 		blame_source_list *list,
 		git_blame__origin *porigin)
 {
-	git_blame_cache *cache = blame->cache;
 	unsigned threshold = blame_copy_score(blame);
 	bool prune = !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE);
 	blame_entry_lines *lines = NULL;
@@ -2175,66 +2291,19 @@ static int find_best_copies_in_list(
 	}
 
 	for (i = 0; i < list->count; i++) {
-		blame_source *s = &list->sources[i];
+		const blame_source *s = &list->sources[i];
 		git_blame__origin *norigin = NULL;
-		git_blob *blob = NULL;
 		mmfile_t file_p;
 
 		if (porigin && !strcmp(s->path, porigin->path))
 			continue;
 
-		if (prune && !s->filtered && !s->no_filter) {
-			PROF_START();
-			error = git_blob_lookup(&blob, blame->repository, &s->id);
-			PROF_STOP(P_COPY_LOAD);
-			if (error < 0)
-				goto done;
-			cache->stats.blob_loads++;
-			PROF_COUNT(prof_copy_sources, 1);
-			PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
-
-			if (git_blob_rawsize(blob) > GIT_XDIFF_MAX_SIZE) {
-				s->no_filter = true;
-			} else {
-				/* Guess the size from the blob; the filter is smaller. */
-				size_t want = (size_t)git_blob_rawsize(blob) / 4 + 64;
-
-				if (!blame_cache_reserve(cache, list, want)) {
-					s->no_filter = true;
-					cache->stats.filters_skipped++;
-				} else {
-					memcpy(&s->salt, s->id.id, sizeof(s->salt));
-					PROF_START();
-					error = blame_filter_build(s,
-						git_blob_rawcontent(blob),
-						(size_t)git_blob_rawsize(blob));
-					PROF_STOP(P_FILTER);
-					if (error < 0) {
-						git_blob_free(blob);
-						goto done;
-					}
-					list->bytes += (size_t)s->nbits / 8;
-					cache->stats.bytes += (size_t)s->nbits / 8;
-					cache->stats.filters_built++;
-				}
-			}
-		}
-
 		git_array_foreach(*candidates, j, c) {
-			cache->stats.source_checks++;
+			blame->cache_counts.checks++;
 
-#ifdef GIT_BLAME_PROFILE
-			if (prune && s->filtered && getenv("GIT_BLAME_DUMP_PRUNE")) {
-				char hx[GIT_OID_MAX_HEXSIZE + 1];
-				git_oid_tostr(hx, sizeof(hx), &s->id);
-				fprintf(stderr, "D %s %zu %zu %d\n", hx, c->ent->lno,
-					c->ent->num_lines,
-					(int)blame_source_can_match(s, &lines[j], threshold));
-			}
-#endif
 			if (prune && s->filtered &&
 			    !blame_source_can_match(s, &lines[j], threshold)) {
-				cache->stats.source_pruned++;
+				blame->cache_counts.pruned++;
 #ifdef GIT_BLAME_PROFILE
 				if (prof_check_prune()) {
 					git_blame__origin *o = NULL;
@@ -2266,19 +2335,17 @@ static int find_best_copies_in_list(
 
 			if (!norigin) {
 				git_commit *commit = NULL;
+				git_blob *blob = NULL;
 
-				if (!blob) {
-					PROF_START();
-					error = git_blob_lookup(&blob,
-						blame->repository, &s->id);
-					PROF_STOP(P_COPY_LOAD);
-					if (error < 0)
-						goto done;
-					cache->stats.blob_loads++;
-					PROF_COUNT(prof_copy_sources, 1);
-					PROF_COUNT(prof_copy_bytes,
-						git_blob_rawsize(blob));
-				}
+				PROF_START();
+				error = git_blob_lookup(&blob, blame->repository,
+					&s->id);
+				PROF_STOP(P_COPY_LOAD);
+				if (error < 0)
+					goto done;
+				blame->cache_counts.blob_loads++;
+				PROF_COUNT(prof_copy_sources, 1);
+				PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
 
 				if ((error = git_commit_dup(&commit, parent)) < 0 ||
 				    (error = new_origin(&norigin, commit, blob,
@@ -2287,12 +2354,11 @@ static int find_best_copies_in_list(
 					git_blob_free(blob);
 					goto done;
 				}
-				blob = NULL; /* norigin owns it now */
 				fill_origin_blob(norigin, &file_p);
 			}
 
 			memset(potential, 0, sizeof(potential));
-			cache->stats.source_xdiffs++;
+			blame->cache_counts.xdiffs++;
 
 			PROF_START();
 			error = find_copy_in_blob(blame, c->ent, norigin,
@@ -2314,7 +2380,6 @@ static int find_best_copies_in_list(
 		}
 
 		origin_decref(norigin);
-		git_blob_free(blob);
 
 		if (error < 0)
 			goto done;
@@ -2342,6 +2407,13 @@ int git_blame_cache_new(
 	cache = git__calloc(1, sizeof(*cache));
 	GIT_ERROR_CHECK_ALLOC(cache);
 
+	if (git_mutex_init(&cache->lock) < 0 ||
+	    git_cond_init(&cache->ready) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to init the blame cache");
+		git__free(cache);
+		return -1;
+	}
+
 	cache->repo = repo;
 	cache->stats.max_bytes = max_bytes ? max_bytes : BLAME_CACHE_DEFAULT_BYTES;
 	*out = cache;
@@ -2361,6 +2433,8 @@ void git_blame_cache_free(git_blame_cache *cache)
 		blame_source_list_free(list);
 
 	blame_source_listmap_dispose(&cache->lists);
+	git_cond_free(&cache->ready);
+	git_mutex_free(&cache->lock);
 	git__free(cache);
 }
 
@@ -2368,8 +2442,13 @@ void git_blame_cache_get_stats(
 		git_blame_cache_stats *out,
 		const git_blame_cache *cache)
 {
-	if (out && cache)
-		memcpy(out, &cache->stats, sizeof(*out));
+	git_blame_cache *c = (git_blame_cache *)cache;
+
+	if (!out || !cache)
+		return;
+	git_mutex_lock(&c->lock);
+	memcpy(out, &c->stats, sizeof(*out));
+	git_mutex_unlock(&c->lock);
 }
 
 static int find_best_copies(
@@ -2515,6 +2594,8 @@ done:
 	clear_copy_candidates(&candidates);
 	clear_copy_candidates(&next);
 	git_diff_free(diff);
+	if (list)
+		blame_cache_release(blame->cache, list);
 	return error;
 }
 
