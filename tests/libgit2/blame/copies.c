@@ -90,3 +90,34 @@ void test_blame_copies__exact_rename_with_several_sources(void)
 	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
 	check_hunk(0, 1, 3, 0, "3da1ad7", "dup-b/same.txt", 1);
 }
+
+void test_blame_copies__inexact_rename(void)
+{
+	blame("sim-dst.txt", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 12, 0, "a604bc2", "sim-src.txt", 1);
+	check_hunk(1, 13, 8, 0, "c3d1cd1", "sim-dst.txt", 13);
+}
+
+void test_blame_copies__inexact_rename_below_threshold(void)
+{
+	/* Less than half of the file is the same: git sees no rename. */
+	blame("low-dst.txt", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 20, 0, "c3d1cd1", "low-dst.txt", 1);
+}
+
+void test_blame_copies__inexact_rename_same_basename(void)
+{
+	/*
+	 * Like git, prefer the only deleted file with the same basename
+	 * when it is similar enough, although bn/other.txt is more similar.
+	 */
+	blame("bn/b/name.txt", GIT_BLAME_NORMAL, 0);
+
+	cl_assert_equal_i(2, git_blame_hunkcount(g_blame));
+	check_hunk(0, 1, 16, 0, "a604bc2", "bn/a/name.txt", 1);
+	check_hunk(1, 17, 4, 0, "c3d1cd1", "bn/b/name.txt", 17);
+}

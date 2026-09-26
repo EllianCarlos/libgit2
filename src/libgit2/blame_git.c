@@ -593,6 +593,330 @@ static const git_diff_delta *find_exact_rename(
 }
 
 /*
+ * The scores of git's rename detection: a similarity of 100% is 60000,
+ * a rename needs 50%, and a rename to a file with the same basename, when
+ * there is only one candidate with that basename, needs 75%.
+ */
+#define BLAME_RENAME_MAX_SCORE 60000.0
+#define BLAME_RENAME_SCORE 30000
+#define BLAME_RENAME_BASENAME_SCORE 45000
+
+/* How many candidates git keeps for a destination of an inexact rename. */
+#define BLAME_RENAME_SLOTS 4
+
+/* git counts a file as binary when a NUL is in its first bytes. */
+#define BLAME_BINARY_CHECK_BYTES 8000
+
+/* The modulus of git's chunk hash. */
+#define BLAME_HASHBASE 107927
+
+/* How many bytes of a blob fall in chunks with a given hash. */
+typedef struct {
+	unsigned int hash;
+	size_t bytes;
+} blame_chunk_count;
+
+typedef git_array_t(blame_chunk_count) blame_chunk_counts;
+
+/* A file that a rename could come from or go to. */
+typedef struct {
+	const git_diff_delta *delta;
+	git_blob *blob;
+	uint16_t mode;
+	bool counted;
+	blame_chunk_counts counts;
+} blame_rename_file;
+
+typedef git_array_t(blame_rename_file) blame_rename_files;
+
+static int add_chunk_count(
+		blame_chunk_counts *counts,
+		unsigned int hash,
+		size_t bytes)
+{
+	blame_chunk_count *c = git_array_alloc(*counts);
+
+	GIT_ERROR_CHECK_ALLOC(c);
+	c->hash = hash;
+	c->bytes = bytes;
+	return 0;
+}
+
+static int chunk_count_cmp(const void *a, const void *b, void *payload)
+{
+	const blame_chunk_count *x = a, *y = b;
+
+	GIT_UNUSED(payload);
+
+	return (x->hash > y->hash) - (x->hash < y->hash);
+}
+
+/*
+ * Cut the contents of `file` into chunks that end at a newline or after
+ * 64 bytes, whichever comes first, and count how many bytes fall in
+ * chunks of each hash, sorted by hash.  In a text file, a CR before a LF
+ * is not part of any chunk.
+ *
+ * The loop that cuts and hashes the chunks is ported from git.git's
+ * `hash_chars` in diffcore-delta.c at
+ * https://github.com/git/git/blob/0f8e75abebff0877cae681a3d5ff31ac47f54220/diffcore-delta.c#L140-L164
+ */
+static int count_chunks(blame_rename_file *file)
+{
+	const unsigned char *buf = git_blob_rawcontent(file->blob);
+	size_t sz = (size_t)git_blob_rawsize(file->blob);
+	unsigned int accum1 = 0, accum2 = 0;
+	blame_chunk_count *c, *last = NULL;
+	bool is_text;
+	size_t i, n = 0;
+	int error;
+
+	is_text = !memchr(buf, 0, min(sz, BLAME_BINARY_CHECK_BYTES));
+
+	while (sz) {
+		unsigned int ch = *buf++;
+		unsigned int old_1 = accum1;
+		sz--;
+
+		/* Ignore CR in CRLF sequence if text */
+		if (is_text && ch == '\r' && sz && *buf == '\n')
+			continue;
+
+		accum1 = (accum1 << 7) ^ (accum2 >> 25);
+		accum2 = (accum2 << 7) ^ (old_1 >> 25);
+		accum1 += ch;
+		if (++n < 64 && ch != '\n')
+			continue;
+		if ((error = add_chunk_count(&file->counts,
+				(accum1 + accum2 * 0x61) % BLAME_HASHBASE,
+				n)) < 0)
+			return error;
+		n = 0;
+		accum1 = accum2 = 0;
+	}
+	if (n > 0 &&
+	    (error = add_chunk_count(&file->counts,
+			(accum1 + accum2 * 0x61) % BLAME_HASHBASE, n)) < 0)
+		return error;
+
+	/* Merge the counts of the chunks that have the same hash. */
+	git__qsort_r(file->counts.ptr, file->counts.size,
+		sizeof(blame_chunk_count), chunk_count_cmp, NULL);
+
+	git_array_foreach(file->counts, i, c) {
+		if (last && last->hash == c->hash)
+			last->bytes += c->bytes;
+		else if (!last)
+			last = c;
+		else
+			*++last = *c;
+	}
+	file->counts.size = last ? (size_t)(last - file->counts.ptr) + 1 : 0;
+
+	file->counted = true;
+	return 0;
+}
+
+/*
+ * How similar the contents of `src` and `dst` are, like git's estimate
+ * for renames: the bytes of `src` that `dst` has too, chunk by chunk,
+ * against the size of the larger file, from 0 to BLAME_RENAME_MAX_SCORE.
+ * Only regular files can be similar, and only when their sizes are close
+ * enough to reach `minimum`.
+ */
+static int rename_similarity(
+		int *out,
+		blame_rename_file *src,
+		blame_rename_file *dst,
+		int minimum)
+{
+	size_t src_size, dst_size, max_size, delta_size;
+	size_t copied = 0, i = 0, j = 0;
+	int error;
+
+	*out = 0;
+
+	if (!GIT_MODE_ISBLOB(src->mode) || !GIT_MODE_ISBLOB(dst->mode))
+		return 0;
+
+	src_size = (size_t)git_blob_rawsize(src->blob);
+	dst_size = (size_t)git_blob_rawsize(dst->blob);
+	max_size = max(src_size, dst_size);
+	delta_size = max_size - min(src_size, dst_size);
+
+	if ((double)max_size * (BLAME_RENAME_MAX_SCORE - minimum) <
+	    (double)delta_size * BLAME_RENAME_MAX_SCORE || !dst_size)
+		return 0;
+
+	if ((!src->counted && (error = count_chunks(src)) < 0) ||
+	    (!dst->counted && (error = count_chunks(dst)) < 0))
+		return error;
+
+	while (i < src->counts.size && j < dst->counts.size) {
+		blame_chunk_count *s = &src->counts.ptr[i],
+		                  *d = &dst->counts.ptr[j];
+
+		if (s->hash < d->hash) {
+			i++;
+		} else if (s->hash > d->hash) {
+			j++;
+		} else {
+			copied += min(s->bytes, d->bytes);
+			i++;
+			j++;
+		}
+	}
+
+	*out = (int)((double)copied * BLAME_RENAME_MAX_SCORE / (double)max_size);
+	return 0;
+}
+
+/* One candidate source of an inexact rename. */
+typedef struct {
+	blame_rename_file *src;
+	int score;
+	bool same_basename;
+} blame_rename_slot;
+
+/* Whether `a` is a worse candidate than `b`; a slot without source is worst. */
+static bool rename_slot_worse(
+		const blame_rename_slot *a,
+		const blame_rename_slot *b)
+{
+	if (!a->src)
+		return b->src != NULL;
+	if (!b->src)
+		return false;
+	if (a->score != b->score)
+		return a->score < b->score;
+	return !a->same_basename && b->same_basename;
+}
+
+static int load_rename_file(
+		blame_rename_file *file,
+		git_repository *repo,
+		const git_diff_delta *delta,
+		const git_diff_file *side)
+{
+	memset(file, 0, sizeof(*file));
+	file->delta = delta;
+	file->mode = side->mode;
+	return git_blob_lookup(&file->blob, repo, &side->id);
+}
+
+static void free_rename_files(blame_rename_files *files)
+{
+	blame_rename_file *file;
+	size_t i;
+
+	git_array_foreach(*files, i, file) {
+		git_blob_free(file->blob);
+		git_array_clear(file->counts);
+	}
+	git_array_clear(*files);
+}
+
+/*
+ * Pick the file that `dst` is an inexact rename of, among the files that
+ * the diff deletes, like git does when it follows one file:
+ *
+ * - If exactly one deleted file has the same basename as `dst`, and it
+ *   is similar enough for BLAME_RENAME_BASENAME_SCORE, take it.
+ * - Else keep the BLAME_RENAME_SLOTS best candidates, in the order of
+ *   the deleted files, where a candidate takes the place of the first
+ *   worst one when it is better, and take the best of them, if it is
+ *   similar enough for BLAME_RENAME_SCORE.  The first slot wins a tie.
+ */
+static int find_inexact_rename(
+		const git_diff_delta **out,
+		git_blame *blame,
+		git_diff *diff,
+		const git_diff_delta *dst)
+{
+	blame_rename_files srcs = GIT_ARRAY_INIT;
+	blame_rename_slot slots[BLAME_RENAME_SLOTS], candidate;
+	blame_rename_file target, *src, *same_base = NULL;
+	size_t i, j, same_base_count = 0, best, worst;
+	int score, error;
+
+	*out = NULL;
+	memset(slots, 0, sizeof(slots));
+
+	if ((error = load_rename_file(&target, blame->repository, dst,
+			&dst->new_file)) < 0)
+		return error;
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+
+		if (delta->status != GIT_DELTA_DELETED)
+			continue;
+
+		if ((src = git_array_alloc(srcs)) == NULL) {
+			git_error_set_oom();
+			error = -1;
+			goto done;
+		}
+
+		if ((error = load_rename_file(src, blame->repository, delta,
+				&delta->old_file)) < 0) {
+			srcs.size--;
+			goto done;
+		}
+	}
+
+	git_array_foreach(srcs, i, src) {
+		if (same_basename(src->delta->old_file.path,
+				dst->new_file.path)) {
+			same_base = src;
+			same_base_count++;
+		}
+	}
+
+	if (same_base_count == 1) {
+		if ((error = rename_similarity(&score, same_base, &target,
+				BLAME_RENAME_BASENAME_SCORE)) < 0)
+			goto done;
+
+		if (score >= BLAME_RENAME_BASENAME_SCORE) {
+			*out = same_base->delta;
+			goto done;
+		}
+	}
+
+	git_array_foreach(srcs, i, src) {
+		if ((error = rename_similarity(&score, src, &target,
+				BLAME_RENAME_SCORE)) < 0)
+			goto done;
+
+		candidate.src = src;
+		candidate.score = score;
+		candidate.same_basename = same_basename(
+			src->delta->old_file.path, dst->new_file.path);
+
+		for (worst = 0, j = 1; j < BLAME_RENAME_SLOTS; j++)
+			if (rename_slot_worse(&slots[j], &slots[worst]))
+				worst = j;
+
+		if (rename_slot_worse(&slots[worst], &candidate))
+			slots[worst] = candidate;
+	}
+
+	for (best = 0, i = 1; i < BLAME_RENAME_SLOTS; i++)
+		if (rename_slot_worse(&slots[best], &slots[i]))
+			best = i;
+
+	if (slots[best].src && slots[best].score >= BLAME_RENAME_SCORE)
+		*out = slots[best].src->delta;
+
+done:
+	free_rename_files(&srcs);
+	git_blob_free(target.blob);
+	git_array_clear(target.counts);
+	return error;
+}
+
+/*
  * Look for the file that the commit of `origin` renamed to the path of
  * `origin`, in `parent`.  Sets `*out` to NULL when there is none.
  */
@@ -603,7 +927,6 @@ static int find_rename(
 		git_blame__origin *origin)
 {
 	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
-	git_diff_find_options findopts = GIT_DIFF_FIND_OPTIONS_INIT;
 	git_tree *otree = NULL, *ptree = NULL;
 	const git_diff_delta *dst = NULL, *src = NULL;
 	git_diff *diff = NULL;
@@ -616,7 +939,6 @@ static int find_rename(
 	diffopts.context_lines = 0;
 	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK |
 	                 GIT_DIFF_INCLUDE_TYPECHANGE;
-	findopts.flags = GIT_DIFF_FIND_RENAMES;
 
 	if ((error = git_commit_tree(&otree, origin->commit)) < 0 ||
 	    (error = git_commit_tree(&ptree, parent)) < 0 ||
@@ -638,20 +960,9 @@ static int find_rename(
 	if (!dst)
 		goto done;
 
-	if ((src = find_exact_rename(diff, dst)) == NULL) {
-		if ((error = git_diff_find_similar(diff, &findopts)) < 0)
-			goto done;
-
-		for (i = 0; i < git_diff_num_deltas(diff); i++) {
-			const git_diff_delta *delta = git_diff_get_delta(diff, i);
-
-			if (delta->status == GIT_DELTA_RENAMED &&
-			    !strcmp(delta->new_file.path, origin->path)) {
-				src = delta;
-				break;
-			}
-		}
-	}
+	if ((src = find_exact_rename(diff, dst)) == NULL &&
+	    (error = find_inexact_rename(&src, blame, diff, dst)) < 0)
+		goto done;
 
 	if (!src)
 		goto done;
