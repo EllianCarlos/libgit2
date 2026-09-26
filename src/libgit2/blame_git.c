@@ -1331,276 +1331,7 @@ static int find_copy_in_blob(
 	return 0;
 }
 
-/*
- * Find lines that `target` is still suspected for anywhere in the blob of
- * `parent`, the same file in a parent commit: this detects lines that
- * were moved or copied within the file.  An entry is split when a run of
- * common lines scores above the move threshold; the parts of the entry
- * that are left are searched again.
- *
- * Returns 1 when `target` is not suspected for any line, 0 when it
- * still is, and a negative error code on failure.
- */
-static int find_move_in_parent(
-		git_blame *blame,
-		git_blame__origin *target,
-		git_blame__origin *parent)
-{
-	unsigned threshold = blame_move_score(blame);
-	git_blame__entry *e, split[3];
-	size_t last_in_target;
-	mmfile_t file_p;
-	int error;
-
-	if (!find_last_in_target(&last_in_target, blame, target))
-		return 1;
-
-	fill_origin_blob(parent, &file_p);
-	if (!file_p.ptr)
-		return 0;
-
-	for (e = blame->ent; e; ) {
-		if (e->guilty || !same_suspect(e->suspect, target) ||
-		    blame_entry_score(blame, e) <= threshold) {
-			e = e->next;
-			continue;
-		}
-
-		memset(split, 0, sizeof(split));
-
-		{
-			PROF_VARS;
-			PROF_START();
-			error = find_copy_in_blob(blame, e, parent, split, &file_p);
-			PROF_STOP(P_MOVE_XDIFF);
-		}
-
-		if (!error && split[1].suspect &&
-		    blame_entry_score(blame, &split[1]) > threshold) {
-			/*
-			 * `e` now holds the part before the moved lines, or the
-			 * moved lines themselves.  Look at it again; the part
-			 * after them follows in the list.
-			 */
-			error = split_blame(blame, split, e, NULL);
-		} else {
-			e = e->next;
-		}
-
-		decref_split(split);
-
-		if (error < 0)
-			return error;
-	}
-
-	return 0;
-}
-
-/* A blame entry that may have been copied, and its best split so far. */
-typedef struct {
-	git_blame__entry *ent;
-	git_blame__entry split[3];
-} blame_copy_candidate;
-
-typedef git_array_t(blame_copy_candidate) blame_copy_candidates;
-
-/* Add `e` to the candidates, if it scores above the copy threshold. */
-static int add_copy_candidate(
-		blame_copy_candidates *candidates,
-		git_blame *blame,
-		git_blame__entry *e)
-{
-	blame_copy_candidate *c;
-
-	if (blame_entry_score(blame, e) <= blame_copy_score(blame))
-		return 0;
-
-	c = git_array_alloc(*candidates);
-	GIT_ERROR_CHECK_ALLOC(c);
-
-	memset(c, 0, sizeof(*c));
-	c->ent = e;
-	return 0;
-}
-
-static void clear_copy_candidates(blame_copy_candidates *candidates)
-{
-	blame_copy_candidate *c;
-	size_t i;
-
-	git_array_foreach(*candidates, i, c)
-		decref_split(c->split);
-
-	git_array_clear(*candidates);
-}
-
-/*
- * List the files of `parent` to search for copied lines: the files that
- * were modified or deleted between `parent` and the commit of `target`.
- * To find copies harder, list the files that were not modified, too:
- * always with `GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES`, and with
- * `GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES` when the commit created or
- * renamed the file of `target`.
- */
-static int diff_copy_sources(
-		git_diff **out,
-		git_blame *blame,
-		git_blame__origin *target,
-		git_commit *parent,
-		git_blame__origin *porigin,
-		uint32_t opt)
-{
-	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
-	git_tree *otree = NULL, *ptree = NULL;
-	int error;
-
-	diffopts.context_lines = 0;
-	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK;
-
-	if ((opt & GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES) ||
-	    ((opt & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES) &&
-	     (!porigin || strcmp(target->path, porigin->path))))
-		diffopts.flags |= GIT_DIFF_INCLUDE_UNMODIFIED;
-
-	if ((error = git_commit_tree(&otree, target->commit)) < 0 ||
-	    (error = git_commit_tree(&ptree, parent)) < 0)
-		goto done;
-
-	error = git_diff_tree_to_tree(out, blame->repository, ptree, otree,
-		&diffopts);
-
-done:
-	git_tree_free(otree);
-	git_tree_free(ptree);
-	return error;
-}
-
-/*
- * Whether the old side of `delta` is a file of the parent to search for
- * copied lines.  The file that `find_move_in_parent` has searched already,
- * and submodules, are not.
- */
-static bool is_copy_source(
-		const git_diff_delta *delta,
-		git_blame__origin *porigin)
-{
-	if (delta->status == GIT_DELTA_ADDED ||
-	    delta->old_file.mode == GIT_FILEMODE_UNREADABLE ||
-	    delta->old_file.mode == GIT_FILEMODE_TREE ||
-	    delta->old_file.mode == GIT_FILEMODE_COMMIT)
-		return false;
-
-	return !porigin || strcmp(delta->old_file.path, porigin->path) != 0;
-}
-
-/* Create an origin for the old side of `delta`, a file of `parent`. */
-static int make_source_origin(
-		git_blame__origin **out,
-		git_blame *blame,
-		git_commit *parent,
-		const git_diff_delta *delta)
-{
-	git_commit *commit = NULL;
-	git_blob *blob = NULL;
-	int error;
-
-	if ((error = git_commit_dup(&commit, parent)) < 0 ||
-	    (error = git_blob_lookup(&blob, blame->repository,
-			&delta->old_file.id)) < 0 ||
-	    (error = new_origin(out, commit, blob, delta->old_file.path,
-			delta->old_file.mode)) < 0) {
-		git_blob_free(blob);
-		git_commit_free(commit);
-	}
-
-	return error;
-}
-
-/*
- * Search every source file for the best match of every candidate, and
- * record it in the candidate.
- */
-static int find_best_copies_in_diff(
-		git_blame *blame,
-		blame_copy_candidates *candidates,
-		git_commit *parent,
-		git_diff *diff,
-		git_blame__origin *porigin)
-{
-	git_blame__entry potential[3];
-	git_blame__origin *norigin = NULL;
-	blame_copy_candidate *c;
-	mmfile_t file_p;
-	size_t i, j;
-	int error = 0;
-	PROF_VARS;
-
-	for (i = 0; i < git_diff_num_deltas(diff); i++) {
-		const git_diff_delta *delta = git_diff_get_delta(diff, i);
-
-		if (!is_copy_source(delta, porigin))
-			continue;
-
-		PROF_START();
-		error = make_source_origin(&norigin, blame, parent, delta);
-		PROF_STOP(P_COPY_LOAD);
-		if (error < 0)
-			return error;
-		PROF_COUNT(prof_copy_sources, 1);
-		PROF_COUNT(prof_copy_bytes, git_blob_rawsize(norigin->blob));
-
-		fill_origin_blob(norigin, &file_p);
-
-		git_array_foreach(*candidates, j, c) {
-			memset(potential, 0, sizeof(potential));
-
-			PROF_START();
-			error = find_copy_in_blob(blame, c->ent, norigin,
-					potential, &file_p);
-			PROF_STOP(P_COPY_XDIFF);
-			PROF_COUNT(prof_copy_xdiffs, 1);
-#ifdef GIT_BLAME_PROFILE
-			if (!error && potential[1].suspect &&
-			    blame_entry_score(blame, &potential[1]) >
-			    blame_copy_score(blame))
-				prof_copy_useful++;
-#endif
-			if (error == 0)
-				copy_split_if_better(blame, c->split, potential);
-
-			decref_split(potential);
-
-			if (error < 0)
-				break;
-		}
-
-		origin_decref(norigin);
-
-		if (error < 0)
-			return error;
-	}
-
-	return 0;
-}
-
-/*
- * The cache that many blames of one repository share (experimental).
- *
- * The search for copied lines in a commit compares the lines of the
- * target with every file that the commit changed, and it does so for
- * each target file that the commit changed.  In a commit that changes
- * 50,000 files, each of those files reads 50,000 blobs again.
- *
- * The cache keeps, for each (commit, parent) pair, the list of the copy
- * sources, and for each source a filter of its lines: a Bloom filter of
- * the hashes of its lines and of each pair of lines that follow one
- * another.  A run of lines that the target and the source have in common
- * is in the filter; so when no run of the target lines that the filter
- * can have scores above the copy threshold, the xdiff of that source
- * cannot give a split above the threshold, and the search skips it.  The
- * filter can have false positives but no false negatives, thus the
- * result does not change.
- */
+/* The line filters of the copy search; see git_blame_cache below. */
 
 #define BLAME_CACHE_DEFAULT_BYTES ((size_t)512 * 1024 * 1024)
 #define BLAME_FILTER_BITS_PER_ITEM 8
@@ -1875,6 +1606,311 @@ static bool blame_source_can_match(
 
 	return false;
 }
+
+/*
+ * Find lines that `target` is still suspected for anywhere in the blob of
+ * `parent`, the same file in a parent commit: this detects lines that
+ * were moved or copied within the file.  An entry is split when a run of
+ * common lines scores above the move threshold; the parts of the entry
+ * that are left are searched again.
+ *
+ * Returns 1 when `target` is not suspected for any line, 0 when it
+ * still is, and a negative error code on failure.
+ */
+static int find_move_in_parent(
+		git_blame *blame,
+		git_blame__origin *target,
+		git_blame__origin *parent)
+{
+	unsigned threshold = blame_move_score(blame);
+	git_blame__entry *e, split[3];
+	blame_source filter;
+	size_t last_in_target;
+	mmfile_t file_p;
+	int error = 0;
+
+	if (!find_last_in_target(&last_in_target, blame, target))
+		return 1;
+
+	fill_origin_blob(parent, &file_p);
+	if (!file_p.ptr)
+		return 0;
+
+	/*
+	 * With a cache, skip the entries that the filter of the parent blob
+	 * proves cannot move there (see blame_source_can_match).
+	 */
+	memset(&filter, 0, sizeof(filter));
+	if (blame->cache &&
+	    !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE) &&
+	    (size_t)file_p.size <= GIT_XDIFF_MAX_SIZE &&
+	    (error = blame_filter_build(&filter, file_p.ptr,
+			(size_t)file_p.size)) < 0)
+		return error;
+
+	for (e = blame->ent; e; ) {
+		if (e->guilty || !same_suspect(e->suspect, target) ||
+		    blame_entry_score(blame, e) <= threshold) {
+			e = e->next;
+			continue;
+		}
+
+		if (filter.filtered) {
+			blame_entry_lines lines;
+			bool can_match;
+
+			if ((error = blame_entry_lines_init(&lines, blame, e)) < 0) {
+				blame_entry_lines_free(&lines);
+				break;
+			}
+			can_match = blame_source_can_match(&filter, &lines,
+				threshold);
+			blame_entry_lines_free(&lines);
+			blame->cache->stats.source_checks++;
+			if (!can_match) {
+				blame->cache->stats.source_pruned++;
+				e = e->next;
+				continue;
+			}
+			blame->cache->stats.source_xdiffs++;
+		}
+
+		memset(split, 0, sizeof(split));
+
+		{
+			PROF_VARS;
+			PROF_START();
+			error = find_copy_in_blob(blame, e, parent, split, &file_p);
+			PROF_STOP(P_MOVE_XDIFF);
+		}
+
+		if (!error && split[1].suspect &&
+		    blame_entry_score(blame, &split[1]) > threshold) {
+			/*
+			 * `e` now holds the part before the moved lines, or the
+			 * moved lines themselves.  Look at it again; the part
+			 * after them follows in the list.
+			 */
+			error = split_blame(blame, split, e, NULL);
+		} else {
+			e = e->next;
+		}
+
+		decref_split(split);
+
+		if (error < 0)
+			break;
+	}
+
+	git__free(filter.bits);
+	return error < 0 ? error : 0;
+}
+
+/* A blame entry that may have been copied, and its best split so far. */
+typedef struct {
+	git_blame__entry *ent;
+	git_blame__entry split[3];
+} blame_copy_candidate;
+
+typedef git_array_t(blame_copy_candidate) blame_copy_candidates;
+
+/* Add `e` to the candidates, if it scores above the copy threshold. */
+static int add_copy_candidate(
+		blame_copy_candidates *candidates,
+		git_blame *blame,
+		git_blame__entry *e)
+{
+	blame_copy_candidate *c;
+
+	if (blame_entry_score(blame, e) <= blame_copy_score(blame))
+		return 0;
+
+	c = git_array_alloc(*candidates);
+	GIT_ERROR_CHECK_ALLOC(c);
+
+	memset(c, 0, sizeof(*c));
+	c->ent = e;
+	return 0;
+}
+
+static void clear_copy_candidates(blame_copy_candidates *candidates)
+{
+	blame_copy_candidate *c;
+	size_t i;
+
+	git_array_foreach(*candidates, i, c)
+		decref_split(c->split);
+
+	git_array_clear(*candidates);
+}
+
+/*
+ * List the files of `parent` to search for copied lines: the files that
+ * were modified or deleted between `parent` and the commit of `target`.
+ * To find copies harder, list the files that were not modified, too:
+ * always with `GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES`, and with
+ * `GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES` when the commit created or
+ * renamed the file of `target`.
+ */
+static int diff_copy_sources(
+		git_diff **out,
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent,
+		git_blame__origin *porigin,
+		uint32_t opt)
+{
+	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
+	git_tree *otree = NULL, *ptree = NULL;
+	int error;
+
+	diffopts.context_lines = 0;
+	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK;
+
+	if ((opt & GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES) ||
+	    ((opt & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES) &&
+	     (!porigin || strcmp(target->path, porigin->path))))
+		diffopts.flags |= GIT_DIFF_INCLUDE_UNMODIFIED;
+
+	if ((error = git_commit_tree(&otree, target->commit)) < 0 ||
+	    (error = git_commit_tree(&ptree, parent)) < 0)
+		goto done;
+
+	error = git_diff_tree_to_tree(out, blame->repository, ptree, otree,
+		&diffopts);
+
+done:
+	git_tree_free(otree);
+	git_tree_free(ptree);
+	return error;
+}
+
+/*
+ * Whether the old side of `delta` is a file of the parent to search for
+ * copied lines.  The file that `find_move_in_parent` has searched already,
+ * and submodules, are not.
+ */
+static bool is_copy_source(
+		const git_diff_delta *delta,
+		git_blame__origin *porigin)
+{
+	if (delta->status == GIT_DELTA_ADDED ||
+	    delta->old_file.mode == GIT_FILEMODE_UNREADABLE ||
+	    delta->old_file.mode == GIT_FILEMODE_TREE ||
+	    delta->old_file.mode == GIT_FILEMODE_COMMIT)
+		return false;
+
+	return !porigin || strcmp(delta->old_file.path, porigin->path) != 0;
+}
+
+/* Create an origin for the old side of `delta`, a file of `parent`. */
+static int make_source_origin(
+		git_blame__origin **out,
+		git_blame *blame,
+		git_commit *parent,
+		const git_diff_delta *delta)
+{
+	git_commit *commit = NULL;
+	git_blob *blob = NULL;
+	int error;
+
+	if ((error = git_commit_dup(&commit, parent)) < 0 ||
+	    (error = git_blob_lookup(&blob, blame->repository,
+			&delta->old_file.id)) < 0 ||
+	    (error = new_origin(out, commit, blob, delta->old_file.path,
+			delta->old_file.mode)) < 0) {
+		git_blob_free(blob);
+		git_commit_free(commit);
+	}
+
+	return error;
+}
+
+/*
+ * Search every source file for the best match of every candidate, and
+ * record it in the candidate.
+ */
+static int find_best_copies_in_diff(
+		git_blame *blame,
+		blame_copy_candidates *candidates,
+		git_commit *parent,
+		git_diff *diff,
+		git_blame__origin *porigin)
+{
+	git_blame__entry potential[3];
+	git_blame__origin *norigin = NULL;
+	blame_copy_candidate *c;
+	mmfile_t file_p;
+	size_t i, j;
+	int error = 0;
+	PROF_VARS;
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+
+		if (!is_copy_source(delta, porigin))
+			continue;
+
+		PROF_START();
+		error = make_source_origin(&norigin, blame, parent, delta);
+		PROF_STOP(P_COPY_LOAD);
+		if (error < 0)
+			return error;
+		PROF_COUNT(prof_copy_sources, 1);
+		PROF_COUNT(prof_copy_bytes, git_blob_rawsize(norigin->blob));
+
+		fill_origin_blob(norigin, &file_p);
+
+		git_array_foreach(*candidates, j, c) {
+			memset(potential, 0, sizeof(potential));
+
+			PROF_START();
+			error = find_copy_in_blob(blame, c->ent, norigin,
+					potential, &file_p);
+			PROF_STOP(P_COPY_XDIFF);
+			PROF_COUNT(prof_copy_xdiffs, 1);
+#ifdef GIT_BLAME_PROFILE
+			if (!error && potential[1].suspect &&
+			    blame_entry_score(blame, &potential[1]) >
+			    blame_copy_score(blame))
+				prof_copy_useful++;
+#endif
+			if (error == 0)
+				copy_split_if_better(blame, c->split, potential);
+
+			decref_split(potential);
+
+			if (error < 0)
+				break;
+		}
+
+		origin_decref(norigin);
+
+		if (error < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+/*
+ * The cache that many blames of one repository share (experimental).
+ *
+ * The search for copied lines in a commit compares the lines of the
+ * target with every file that the commit changed, and it does so for
+ * each target file that the commit changed.  In a commit that changes
+ * 50,000 files, each of those files reads 50,000 blobs again.
+ *
+ * The cache keeps, for each (commit, parent) pair, the list of the copy
+ * sources, and for each source a filter of its lines: a Bloom filter of
+ * the hashes of its lines and of each pair of lines that follow one
+ * another.  A run of lines that the target and the source have in common
+ * is in the filter; so when no run of the target lines that the filter
+ * can have scores above the copy threshold, the xdiff of that source
+ * cannot give a split above the threshold, and the search skips it.  The
+ * filter can have false positives but no false negatives, thus the
+ * result does not change.
+ */
 
 static void blame_source_list_free(blame_source_list *list)
 {
