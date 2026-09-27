@@ -22,6 +22,8 @@
  *    one cache, and take the files of the list in order.
  * -r blames the whole list PASSES times (the output of the last pass
  *    stays); pass 2 shows the cost with a warm cache.
+ * -c sets only the size of the libgit2 object cache of each repository
+ *    to MiB (default 256); with -j, each thread has its own.
  * -O sets the libgit2 object cache to MiB, and lets it keep trees and
  *    blobs up to 4 MiB (by default it keeps no blob, and no tree above
  *    4 KiB).
@@ -170,7 +172,7 @@ int main(int argc, char **argv)
 	FILE *list;
 	char line[8192];
 	int c_count = 0, use_cache = 1, a = 1, nthreads = 1, t;
-	size_t mib = 512, alloc = 0, objmib = 0;
+	size_t mib = 512, alloc = 0, objmib = 0, cachemib = 0;
 
 	stats = stderr;
 	for (; a < argc && argv[a][0] == '-' && argv[a][1]; a++) {
@@ -191,6 +193,8 @@ int main(int argc, char **argv)
 			mib = (size_t)atol(argv[++a]);
 		} else if (!strcmp(s, "-j") && a + 1 < argc) {
 			nthreads = atoi(argv[++a]);
+		} else if (!strcmp(s, "-c") && a + 1 < argc) {
+			cachemib = (size_t)atol(argv[++a]);
 		} else if (!strcmp(s, "-O") && a + 1 < argc) {
 			objmib = (size_t)atol(argv[++a]);
 		} else if (!strcmp(s, "-r") && a + 1 < argc) {
@@ -219,6 +223,9 @@ int main(int argc, char **argv)
 
 	git_libgit2_init();
 	git_libgit2_opts(GIT_OPT_ENABLE_STRICT_HASH_VERIFICATION, 0);
+	if (cachemib)
+		git_libgit2_opts(GIT_OPT_SET_CACHE_MAX_SIZE,
+			(ssize_t)(cachemib << 20));
 	if (objmib) {
 		git_libgit2_opts(GIT_OPT_SET_CACHE_MAX_SIZE,
 			(ssize_t)(objmib << 20));
