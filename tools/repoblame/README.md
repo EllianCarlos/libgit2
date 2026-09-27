@@ -48,7 +48,8 @@ Options:
 | `-j N` | N threads, each with its own `git_repository`, one shared cache |
 | `-r N` | blame the list N times (pass 2 shows the cost with a warm cache) |
 | `-n` | no cache (plain `git_blame_file`, one process) |
-| `-O MiB` | libgit2 object cache size (measured: slower; do not use) |
+| `-c MiB` | size of the libgit2 object cache of each repository (default 256); use `-c 64` with `-j 2` to stay below 2 GB |
+| `-O MiB` | libgit2 object cache size, and keep trees and blobs up to 4 MiB (measured: slower; do not use) |
 
 The tool turns off the hash verification of objects
 (`GIT_OPT_ENABLE_STRICT_HASH_VERIFICATION`), because git does not verify
