@@ -127,3 +127,10 @@ than 200 KB are added by a huge commit. If each costs as much as
 Playbook.java, they add up to about 143 CPU h for git and 57 CPU h for
 repoblame. This estimate is rough: the cost depends on the size of the
 file and on how similar the other files are.
+
+## Proof of equivalence
+
+These measurements show equal output on a sample. The Lean 4 proof in
+[EllianCarlos/repoblame-proof](https://github.com/EllianCarlos/repoblame-proof)
+shows it for every input, in a model of this code at `3cbd497e5`. See its
+`README.md` for the hypotheses and for what is not proved.
