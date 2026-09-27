@@ -67,6 +67,16 @@ line with `out/<idx>.txt`: commit, original line, original path.
 It prints a row for each file that differs, and a total. The exit code
 is 1 when a file differs.
 
+## Correctness
+
+A Lean 4 proof shows that `git_blame_file_cached()` gives the same result
+as `git_blame_file()` for every file, for any order of files and threads,
+and for any eviction from the cache. It is in its own repository:
+[EllianCarlos/repoblame-proof](https://github.com/EllianCarlos/repoblame-proof).
+The proof has no `sorry` and uses only Lean's standard axioms. It assumes
+that the Lean model matches the C code; a replay of C traces tests this
+(0 failures). Differential tests on 231 repositories found 0 differences.
+
 ## Results
 
 See `RESULTS.md` in this directory: measurements on
