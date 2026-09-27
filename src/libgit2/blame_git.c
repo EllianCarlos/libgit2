@@ -2322,6 +2322,33 @@ static int find_best_copies_in_list(
 			if (prune && s->filtered &&
 			    !blame_source_can_match(s, &lines[j], bar)) {
 				blame->cache_counts.pruned++;
+#ifdef GIT_BLAME_PROFILE
+				/* Check mode: the skipped xdiff must not beat `bar`. */
+				if (prof_check_prune()) {
+					git_blame__origin *o = NULL;
+					git_commit *pc = NULL;
+					git_blob *pb = NULL;
+					mmfile_t fp;
+
+					memset(potential, 0, sizeof(potential));
+					if (git_commit_dup(&pc, parent) == 0 &&
+					    git_blob_lookup(&pb, blame->repository, &s->id) == 0 &&
+					    new_origin(&o, pc, pb, s->path, s->mode) == 0) {
+						fill_origin_blob(o, &fp);
+						if (find_copy_in_blob(blame, c->ent, o,
+								potential, &fp) == 0 &&
+						    potential[1].suspect &&
+						    blame_entry_score(blame, &potential[1]) > bar) {
+							prof_prune_violations++;
+							fprintf(stderr, "PRUNE VIOLATION (copy) %s lno=%zu n=%zu score=%u bar=%u\n",
+								s->path, c->ent->lno, c->ent->num_lines,
+								blame_entry_score(blame, &potential[1]), bar);
+						}
+						decref_split(potential);
+						origin_decref(o);
+					}
+				}
+#endif
 				continue;
 			}
 
