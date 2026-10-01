@@ -21,6 +21,9 @@
  */
 
 #include "xinclude.h"
+#ifdef GIT_BLAME_PROFILE
+#include <time.h>
+#endif
 
 #define XDL_MAX_COST_MIN 256
 #define XDL_HEUR_MIN_COST 256
@@ -317,8 +320,23 @@ int xdl_do_diff(mmfile_t *mf1, mmfile_t *mf2, xpparam_t const *xpp,
 	diffdata_t dd1, dd2;
 	int res;
 
+#ifdef GIT_BLAME_PROFILE
+	{
+		extern double xdl_prof_prepare_s;
+		struct timespec ts0, ts1;
+		int r;
+		clock_gettime(CLOCK_MONOTONIC, &ts0);
+		r = xdl_prepare_env(mf1, mf2, xpp, xe);
+		clock_gettime(CLOCK_MONOTONIC, &ts1);
+		xdl_prof_prepare_s += (ts1.tv_sec - ts0.tv_sec) +
+			(ts1.tv_nsec - ts0.tv_nsec) / 1e9;
+		if (r < 0)
+			return -1;
+	}
+#else
 	if (xdl_prepare_env(mf1, mf2, xpp, xe) < 0)
 		return -1;
+#endif
 
 	if (XDF_DIFF_ALG(xpp->flags) == XDF_PATIENCE_DIFF) {
 		res = xdl_do_patience_diff(xpp, xe);

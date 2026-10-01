@@ -332,3 +332,101 @@ void test_blame_copies__file_in_root_commit(void)
 	cl_assert_equal_i(1, git_blame_hunkcount(g_blame));
 	check_hunk(0, 1, 3, 1, "37495f8", "root.txt", 1);
 }
+
+/*
+ * A cache that many blames share must not change any result: blame each
+ * file of the fixture with each copy option, once without a cache and
+ * once with one cache for all of them, and compare the hunks.
+ */
+static void check_cache_same(size_t max_bytes)
+{
+	static const struct { unsigned int flags; uint16_t min; } modes[] = {
+		{ GIT_BLAME_TRACK_COPIES_SAME_FILE, 0 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 0 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 100 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES, 10 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES, 0 },
+		{ GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES, 0 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES |
+		  GIT_BLAME_IGNORE_WHITESPACE, 0 },
+		{ GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES |
+		  GIT_BLAME_FIRST_PARENT, 0 },
+	};
+	git_blame_cache *cache;
+	git_object *head;
+	git_tree *tree;
+	size_t m, f, h;
+
+	cl_git_pass(git_revparse_single(&head, g_repo, "HEAD^{tree}"));
+	tree = (git_tree *)head;
+	cl_git_pass(git_blame_cache_new(&cache, g_repo, max_bytes));
+
+	for (m = 0; m < ARRAY_SIZE(modes); m++) {
+		for (f = 0; f < git_tree_entrycount(tree); f++) {
+			const git_tree_entry *te = git_tree_entry_byindex(tree, f);
+			git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
+			git_blame *plain = NULL, *cached = NULL;
+
+			if (git_tree_entry_type(te) != GIT_OBJECT_BLOB)
+				continue;
+
+			opts.flags = modes[m].flags;
+			opts.min_match_characters = modes[m].min;
+			cl_git_pass(git_blame_file(&plain, g_repo,
+				git_tree_entry_name(te), &opts));
+			cl_git_pass(git_blame_file_cached(&cached, g_repo,
+				git_tree_entry_name(te), &opts, cache));
+
+			cl_assert_equal_i(git_blame_hunkcount(plain),
+				git_blame_hunkcount(cached));
+			for (h = 0; h < git_blame_hunkcount(plain); h++) {
+				const git_blame_hunk *a =
+					git_blame_hunk_byindex(plain, h);
+				const git_blame_hunk *b =
+					git_blame_hunk_byindex(cached, h);
+
+				cl_assert(git_oid_equal(&a->orig_commit_id,
+					&b->orig_commit_id));
+				cl_assert_equal_s(a->orig_path, b->orig_path);
+				cl_assert_equal_i(a->orig_start_line_number,
+					b->orig_start_line_number);
+				cl_assert_equal_i(a->lines_in_hunk,
+					b->lines_in_hunk);
+			}
+
+			git_blame_free(plain);
+			git_blame_free(cached);
+		}
+	}
+
+	git_blame_cache_free(cache);
+	git_object_free(head);
+}
+
+void test_blame_copies__cache_gives_same_results(void)
+{
+	check_cache_same(0);
+}
+
+void test_blame_copies__small_cache_gives_same_results(void)
+{
+	/* Too small for any filter: each list is removed for the next. */
+	check_cache_same(1);
+}
+
+void test_blame_copies__cache_prunes_sources(void)
+{
+	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
+	git_blame_cache_stats st;
+	git_blame_cache *cache;
+
+	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES;
+	cl_git_pass(git_blame_cache_new(&cache, g_repo, 0));
+	cl_git_pass(git_blame_file_cached(&g_blame, g_repo, "to.txt", &opts,
+		cache));
+	git_blame_cache_get_stats(&st, cache);
+	cl_assert(st.list_misses > 0);
+	cl_assert(st.filters_built > 0);
+	cl_assert_equal_i(st.source_checks, st.source_pruned + st.source_xdiffs);
+	git_blame_cache_free(cache);
+}
