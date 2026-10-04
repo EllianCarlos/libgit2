@@ -2816,11 +2816,25 @@ int git_blame__like_git(git_blame *blame, uint32_t opt)
 	while (true) {
 		git_blame__entry *ent;
 		git_blame__origin *suspect = NULL;
+		git_time_t time = 0, t;
 
-		/* Find a suspect to break down */
-		for (ent = blame->ent; !suspect && ent; ent = ent->next)
-			if (!ent->guilty)
+		/*
+		 * Find a suspect to break down: like git, the one with the
+		 * most recent commit (the first in line order if more have
+		 * the same time).  Thus a commit usually comes after all the
+		 * commits that can pass lines to it, and its search for
+		 * copies runs once, not once more for each line that comes
+		 * late.
+		 */
+		for (ent = blame->ent; ent; ent = ent->next) {
+			if (ent->guilty)
+				continue;
+			t = git_commit_time(ent->suspect->commit);
+			if (!suspect || t > time) {
 				suspect = ent->suspect;
+				time = t;
+			}
+		}
 		if (!suspect)
 			break;
 
