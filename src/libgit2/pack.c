@@ -103,6 +103,36 @@ static int cache_init(git_pack_cache *cache)
 	return 0;
 }
 
+/* Run with the cache lock held */
+static void lru_unlink(git_pack_cache *cache, git_pack_cache_entry *entry)
+{
+	if (entry->lru_prev)
+		entry->lru_prev->lru_next = entry->lru_next;
+	else
+		cache->lru_head = entry->lru_next;
+
+	if (entry->lru_next)
+		entry->lru_next->lru_prev = entry->lru_prev;
+	else
+		cache->lru_tail = entry->lru_prev;
+
+	entry->lru_prev = entry->lru_next = NULL;
+}
+
+/* Run with the cache lock held */
+static void lru_push(git_pack_cache *cache, git_pack_cache_entry *entry)
+{
+	entry->lru_prev = NULL;
+	entry->lru_next = cache->lru_head;
+
+	if (cache->lru_head)
+		cache->lru_head->lru_prev = entry;
+	else
+		cache->lru_tail = entry;
+
+	cache->lru_head = entry;
+}
+
 static git_pack_cache_entry *cache_get(git_pack_cache *cache, off64_t offset)
 {
 	git_pack_cache_entry *entry = NULL;
@@ -112,7 +142,8 @@ static git_pack_cache_entry *cache_get(git_pack_cache *cache, off64_t offset)
 
 	if (git_pack_offsetmap_get(&entry, &cache->entries, offset) == 0) {
 		git_atomic32_inc(&entry->refcount);
-		entry->last_usage = cache->use_ctr++;
+		lru_unlink(cache, entry);
+		lru_push(cache, entry);
 	}
 
 	git_mutex_unlock(&cache->lock);
@@ -120,20 +151,29 @@ static git_pack_cache_entry *cache_get(git_pack_cache *cache, off64_t offset)
 	return entry;
 }
 
-/* Run with the cache lock held */
-static void free_lowest_entry(git_pack_cache *cache)
+/*
+ * Free the least recently used entries that nobody uses, until `len`
+ * more bytes fit in the cache.  Return false when they do not fit.
+ * Run with the cache lock held.
+ */
+static bool evict_entries(git_pack_cache *cache, size_t len)
 {
-	git_hashmap_iter_t iter = GIT_HASHMAP_ITER_INIT;
-	git_pack_cache_entry *entry;
-	off64_t offset;
+	git_pack_cache_entry *entry = cache->lru_tail, *prev;
 
-	while (git_pack_offsetmap_iterate(&iter, &offset, &entry, &cache->entries) == 0) {
-		if (entry && git_atomic32_get(&entry->refcount) == 0) {
+	while (entry && cache->memory_used + len > cache->memory_limit) {
+		prev = entry->lru_prev;
+
+		if (git_atomic32_get(&entry->refcount) == 0) {
 			cache->memory_used -= entry->raw.len;
-			git_pack_offsetmap_remove(&cache->entries, offset);
+			git_pack_offsetmap_remove(&cache->entries, entry->offset);
+			lru_unlink(cache, entry);
 			free_cache_object(entry);
 		}
+
+		entry = prev;
 	}
+
+	return cache->memory_used + len <= cache->memory_limit;
 }
 
 static int cache_add(
@@ -143,32 +183,36 @@ static int cache_add(
 		off64_t offset)
 {
 	git_pack_cache_entry *entry;
-	int exists;
+	bool added = false;
 
 	if (base->len > GIT_PACK_CACHE_SIZE_LIMIT)
 		return -1;
 
 	entry = new_cache_object(base);
 	if (entry) {
+		entry->offset = offset;
+
 		if (git_mutex_lock(&cache->lock) < 0) {
 			git_error_set(GIT_ERROR_OS, "failed to lock cache");
 			git__free(entry);
 			return -1;
 		}
-		/* Add it to the cache if nobody else has */
-		exists = git_pack_offsetmap_contains(&cache->entries, offset);
-		if (!exists) {
-			while (cache->memory_used + base->len > cache->memory_limit)
-				free_lowest_entry(cache);
-
-			git_pack_offsetmap_put(&cache->entries, offset, entry);
+		/*
+		 * Add it to the cache if nobody else has, and if it fits
+		 * after the eviction of unused entries.
+		 */
+		if (!git_pack_offsetmap_contains(&cache->entries, offset) &&
+		    evict_entries(cache, base->len) &&
+		    git_pack_offsetmap_put(&cache->entries, offset, entry) == 0) {
+			lru_push(cache, entry);
 			cache->memory_used += entry->raw.len;
+			added = true;
 
 			*cached_out = entry;
 		}
 		git_mutex_unlock(&cache->lock);
-		/* Somebody beat us to adding it into the cache */
-		if (exists) {
+
+		if (!added) {
 			git__free(entry);
 			return -1;
 		}
