@@ -621,6 +621,7 @@ static int find_origin(
 		git_blame__origin *origin)
 {
 	git_tree_entry *entry;
+	git_blob *blob;
 	int error;
 
 	*out = NULL;
@@ -629,9 +630,23 @@ static int find_origin(
 		return error;
 
 	if (GIT_MODE_TYPE(git_tree_entry_filemode_raw(entry)) ==
-	    GIT_MODE_TYPE(origin->mode))
-		error = make_origin_from_entry(out, blame->repository, parent,
-			origin->path, entry);
+	    GIT_MODE_TYPE(origin->mode)) {
+		if (origin->blob &&
+		    git_oid_equal(git_tree_entry_id(entry),
+		                  git_blob_id(origin->blob))) {
+			/*
+			 * The parent has the same blob (the most common
+			 * case): share it, like git, and do not read it again.
+			 */
+			if ((error = git_blob_dup(&blob, origin->blob)) == 0 &&
+			    (error = new_origin(out, parent, blob, origin->path,
+					(uint16_t)git_tree_entry_filemode_raw(entry))) < 0)
+				git_blob_free(blob);
+		} else {
+			error = make_origin_from_entry(out, blame->repository,
+				parent, origin->path, entry);
+		}
+	}
 
 	git_tree_entry_free(entry);
 	return error;
