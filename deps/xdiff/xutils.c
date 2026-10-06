@@ -294,20 +294,66 @@ static unsigned long xdl_hash_record_with_whitespace(char const **data,
 	return ha;
 }
 
-unsigned long xdl_hash_record(char const **data, char const *top, long flags) {
-	unsigned long ha = 5381;
-	char const *ptr = *data;
+/*
+ * Compiler reassociation barrier: pretend to modify X and Y to disallow
+ * changing evaluation order with respect to following uses of X and Y.
+ */
+#ifdef __GNUC__
+#define REASSOC_FENCE(x, y) __asm__("" : "+r"(x), "+r"(y))
+#else
+#define REASSOC_FENCE(x, y)
+#endif
 
+/*
+ * The djb2 hash of a line, two characters per iteration (from git's
+ * xdl_hash_record_verbatim).  It differs from the hash with whitespace
+ * flags, but xdiff only compares hashes made with the same flags.
+ */
+static unsigned long xdl_hash_record_verbatim(char const **data, char const *top) {
+	unsigned long ha = 5381, c0, c1;
+	unsigned char const *ptr = (unsigned char const *) *data;
+	unsigned char const *end = (unsigned char const *) top;
+
+	if (end - ptr >= 2) do {
+		if ((c0 = ptr[0]) == '\n') {
+			*data = (char const *) ptr + 1;
+			return ha;
+		}
+		if ((c1 = ptr[1]) == '\n') {
+			*data = (char const *) ptr + 2;
+			c0 += ha;
+			REASSOC_FENCE(c0, ha);
+			ha = ha * 32 + c0;
+			return ha;
+		}
+		/*
+		 * HA = (HA * 33 + C0) * 33 + C1, evaluated as
+		 * HA * 33 * 33 + (C0 * 32 + (C0 + C1)), so that the chain
+		 * over HA is one multiplication and one addition.
+		 */
+		ha *= 33 * 33;
+		c1 += c0;
+		REASSOC_FENCE(c1, c0);
+		c1 += c0 * 32;
+		REASSOC_FENCE(c1, ha);
+		ha += c1;
+
+		ptr += 2;
+	} while (ptr < end - 1);
+	*data = top;
+	if (ptr < end && (c0 = ptr[0]) != '\n') {
+		c0 += ha;
+		REASSOC_FENCE(c0, ha);
+		ha = ha * 32 + c0;
+	}
+	return ha;
+}
+
+unsigned long xdl_hash_record(char const **data, char const *top, long flags) {
 	if (flags & XDF_WHITESPACE_FLAGS)
 		return xdl_hash_record_with_whitespace(data, top, flags);
 
-	for (; ptr < top && *ptr != '\n'; ptr++) {
-		ha += (ha << 5);
-		ha ^= (unsigned long) *ptr;
-	}
-	*data = ptr < top ? ptr + 1: ptr;
-
-	return ha;
+	return xdl_hash_record_verbatim(data, top);
 }
 
 unsigned int xdl_hashbits(unsigned int size) {
