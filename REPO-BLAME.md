@@ -19,10 +19,12 @@ marked "not recorded".
   libgit2 variants. The compiler and its version are not recorded.
 - Metric: CPU time (user + sys) of one process per file. Wall time is not
   used.
-- Each command ran with `nice -n 19` in a systemd scope with
-  `MemoryMax=2G`, after a load gate. The runner records user and sys time
-  and peak RSS from `wait4()`. The order of git and libgit2 alternates per
-  file.
+- The runner of the earlier work (step 1) ran each command with
+  `nice -n 19` in a systemd scope with `MemoryMax=2G`, after a load gate,
+  and recorded user and sys time from `wait4()`. Whether the 12-file runs
+  used the same runner is not recorded. The bench scripts of the 12-file
+  runs (`run.py`, `analyze.py`, `eq199.py`, `mkbuild.sh`) were in a
+  temporary folder and are not kept.
 
 ## Method
 
@@ -36,11 +38,9 @@ marked "not recorded".
   harness for the 12 files is not recorded. The harness source is not on
   this branch.
 - The 12 files: the rule that selects them and the list of their paths
-  are not recorded. They are a subset of the 199 random files of the
-  sample used for the earlier work (seed 4242, four strata by the number
-  of commits that change 10,000 or more files, see
-  `tools/repoblame/RESULTS.md`). That the 12 are drawn from this sample is
-  not recorded either. The sections below call files by their index
+  are not recorded. The earlier work used a sample of 199 random files
+  (seed 4242, see `tools/repoblame/RESULTS.md`). Whether the 12 come from
+  that sample is not recorded. The text below calls files by their index
   (file 2, file 31, file 71). The index table is not recorded.
 - Variants:
   - HEAD: `32e7cdf15`, bundled zlib (`USE_COMPRESSION=builtin`).
@@ -69,8 +69,9 @@ With the changes and zlib-ng:
 - File 2 (105 s): 1.08 times git.
 
 The per-file CPU seconds of each variant are not recorded. Only the totals
-above and the ranges in this list are recorded. A first measurement of
-HEAD gave 1.56 times git; the table uses 1.55 from the final run.
+above and the ranges in this list are recorded. The cause analysis
+of HEAD quotes 1.56 times git, and the table has 1.55. Which run gave
+which value is not recorded.
 
 All variants: 31,019 of 31,019 lines equal to `git blame -C100`.
 
