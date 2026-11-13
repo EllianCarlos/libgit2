@@ -1296,7 +1296,7 @@ GIT_HASHMAP_STR_SETUP(blame_source_listmap, blame_source_list *);
  * so a blame reads it without the lock.
  */
 struct git_blame_cache {
-	git_repository *repo;
+	char *gitdir;
 	git_mutex lock;
 	git_cond ready;
 	blame_source_listmap lists;
@@ -1488,6 +1488,7 @@ static int blame_filter_build(
 		git__free(h);
 		git__free(sc);
 		git__free(items);
+		git_error_set_oom();
 		return -1;
 	}
 	s->nbits = (uint32_t)nbits;
@@ -2110,9 +2111,28 @@ static void blame_cache_release(git_blame_cache *cache, blame_source_list *list)
 {
 	if (!list)
 		return;
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
 	list->refcount--;
 	git_mutex_unlock(&cache->lock);
+}
+
+int git_blame__cache_check_repo(
+		git_blame_cache *cache,
+		git_repository *repo)
+{
+	if (!cache)
+		return 0;
+
+	if (strcmp(cache->gitdir, git_repository_path(repo)) != 0) {
+		git_error_set(GIT_ERROR_INVALID,
+			"the blame cache was made for another repository");
+		return -1;
+	}
+
+	return 0;
 }
 
 void git_blame__cache_merge_counts(git_blame *blame)
@@ -2121,7 +2141,10 @@ void git_blame__cache_merge_counts(git_blame *blame)
 
 	if (!cache)
 		return;
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
 	cache->stats.source_checks += blame->cache_counts.checks;
 	cache->stats.source_pruned += blame->cache_counts.pruned;
 	cache->stats.source_xdiffs += blame->cache_counts.xdiffs;
@@ -2260,14 +2283,21 @@ int git_blame_cache_new(
 	cache = git__calloc(1, sizeof(*cache));
 	GIT_ERROR_CHECK_ALLOC(cache);
 
+	cache->gitdir = git__strdup(git_repository_path(repo));
+	if (!cache->gitdir) {
+		git__free(cache);
+		git_error_set_oom();
+		return -1;
+	}
+
 	if (git_mutex_init(&cache->lock) < 0 ||
 	    git_cond_init(&cache->ready) < 0) {
 		git_error_set(GIT_ERROR_THREAD, "unable to init the blame cache");
+		git__free(cache->gitdir);
 		git__free(cache);
 		return -1;
 	}
 
-	cache->repo = repo;
 	cache->stats.max_bytes = max_bytes ? max_bytes : BLAME_CACHE_DEFAULT_BYTES;
 	*out = cache;
 	return 0;
@@ -2288,6 +2318,7 @@ void git_blame_cache_free(git_blame_cache *cache)
 	blame_source_listmap_dispose(&cache->lists);
 	git_cond_free(&cache->ready);
 	git_mutex_free(&cache->lock);
+	git__free(cache->gitdir);
 	git__free(cache);
 }
 
@@ -2299,7 +2330,11 @@ void git_blame_cache_get_stats(
 
 	if (!out || !cache)
 		return;
-	git_mutex_lock(&c->lock);
+	if (git_mutex_lock(&c->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		memset(out, 0, sizeof(*out));
+		return;
+	}
 	memcpy(out, &c->stats, sizeof(*out));
 	git_mutex_unlock(&c->lock);
 }

@@ -82,7 +82,7 @@ more CPU time.
 
 ## Exactness check
 
-A profile build with `GIT_BLAME_CHECK_PRUNE=1` runs the xdiff for each
+A measurement build (its code is no longer in the tree) ran the xdiff for each
 skipped pair and reports a split above the bar. On all 199 files:
 27,608,806 skipped pairs (copy and move search), 0 violations, and the
 output is 100% equal to git. The blame tests of libgit2 (57, including

@@ -155,7 +155,7 @@ static void print_stats(FILE *f, git_blame_cache *cache)
 		return;
 	git_blame_cache_get_stats(&st, cache);
 	fprintf(f, "# cache bytes=%zu max=%zu lists=%zu hits=%zu misses=%zu "
-		"evictions=%zu filters=%zu filters_skipped=%zu checks=%zu "
+		"evictions=%zu filters=%zu checks=%zu "
 		"pruned=%zu xdiffs=%zu blob_loads=%zu\n",
 		st.bytes, st.max_bytes, st.lists, st.list_hits,
 		st.list_misses, st.list_evictions, st.filters_built,
