@@ -1,5 +1,7 @@
 # Repository blame: per-file speed
 
+## 2026-10-04 Per-file speed
+
 This file records how the speed of `git_blame_file` was measured against
 `git blame -C100` on one file. The target repository is
 `googleapis/google-cloud-java`, tokenized by cregit (one token per line).
@@ -9,22 +11,19 @@ marked "not recorded".
 
 ## Setup
 
-- Repository: `googleapis/google-cloud-java`, bare shared clone, 104,471
-  commits.
+- Repository: `googleapis/google-cloud-java`, 104,471 commits (from
+  `tools/repoblame/RESULTS.md`).
 - Pinned revision: `59fea8a53722fd7c01eacf848d9b75f5f0fe08ad`.
-- Machine: 16 cores. During the runs the 1-minute load was 17 to 20 (from
-  other work). The CPU model, the memory size and the kernel are not
-  recorded.
-- Build type of libgit2: RelWithDebInfo (`-O2 -g`), the same for all
-  libgit2 variants. The compiler and its version are not recorded.
+- Machine: not recorded (core count, CPU model, memory, kernel, and the
+  load during the runs).
+- Build type of libgit2 in the earlier work: RelWithDebInfo (`-O2 -g`). Whether
+  the 12-file runs used it is not recorded. The compiler and its version are not recorded.
 - Metric: CPU time (user + sys) of one process per file. Wall time is not
   used.
-- The runner of the earlier work (step 1) ran each command with
-  `nice -n 19` in a systemd scope with `MemoryMax=2G`, after a load gate,
-  and recorded user and sys time from `wait4()`. Whether the 12-file runs
-  used the same runner is not recorded. The bench scripts of the 12-file
-  runs (`run.py`, `analyze.py`, `eq199.py`, `mkbuild.sh`) were in a
-  temporary folder and are not kept.
+- The earlier work ran each command with `nice -n 19` in a systemd scope
+  with `MemoryMax=2G` (`tools/repoblame/RESULTS.md`). Whether the 12-file
+  runs did the same is not recorded. The bench scripts of the 12-file runs
+  are not on this branch.
 
 ## Method
 
@@ -32,7 +31,7 @@ marked "not recorded".
   one process per file. The exact command line (file argument, other
   options such as `--line-porcelain`) is not recorded. The git version is
   not recorded.
-- The libgit2 side is the harness `lg2blame -C100`, which calls
+- The libgit2 side is the harness `lg2blame -C100` (named in `tools/repoblame/RESULTS.md`), which calls
   `git_blame_file` with copy detection across files in the same commit
   and threshold 100, one process per file. The exact command line of the
   harness for the 12 files is not recorded. The harness source is not on
@@ -40,17 +39,16 @@ marked "not recorded".
 - The 12 files: the rule that selects them and the list of their paths
   are not recorded. The earlier work used a sample of 199 random files
   (seed 4242, see `tools/repoblame/RESULTS.md`). Whether the 12 come from
-  that sample is not recorded. The text below calls files by their index
-  (file 2, file 31, file 71). The index table is not recorded.
+  that sample is not recorded.
 - Variants:
-  - HEAD: `32e7cdf15`, bundled zlib (`USE_COMPRESSION=builtin`).
+  - HEAD: `32e7cdf15`, bundled zlib (the build option is not recorded).
   - changes, bundled zlib: this branch (`8202141ee`), bundled zlib.
-  - changes, zlib-ng: this branch, zlib-ng 2.3.3 in compat mode. The
+  - changes, zlib-ng: this branch, zlib-ng in compat mode (the version is not recorded). The
     build flags that select zlib-ng (CMake options, library paths) are
     not recorded.
-- Equivalence check: the output (commit, original path, original line) of
-  each line is compared with `git blame -C100`. The comparison script is
-  not on this branch.
+- Equivalence check: `tools/repoblame/check.py` compares the output of
+  repoblame with `git blame --line-porcelain`. The script that checked
+  the 199 files for this branch is not recorded.
 
 ## Results (12 files, CPU s, one process per file)
 
@@ -63,41 +61,36 @@ marked "not recorded".
 
 With the changes and zlib-ng:
 
-- Small file 31: 0.22 times git (0.02 s).
-- Six files of 17 to 22 s: 1.00 to 1.05 times git.
-- Four files of 35 to 87 s: 1.02 to 1.09 times git.
-- File 2 (105 s): 1.08 times git.
+- A small file: 0.22 times git.
+- The typical files: 1.00 to 1.05 times git.
+- The large files: 1.02 to 1.09 times git.
 
-The per-file CPU seconds of each variant are not recorded. Only the totals
-above and the ranges in this list are recorded. The cause analysis
-of HEAD quotes 1.56 times git, and the table has 1.55. Which run gave
-which value is not recorded.
+The per-file CPU seconds, the file indexes and the number of files in each
+group are not recorded. Only the totals above and these ranges are
+recorded (pull request body).
 
-All variants: 31,019 of 31,019 lines equal to `git blame -C100`.
-
-Equivalence with the changes and zlib-ng on the 199 random files: 199 of
-199 files equal to git, 474,664 lines. CPU 5,089 s (the git run of the
-same files took 4,845 s, with other load).
+Equivalence on the 199 random files: 199 of 199 files equal to
+`git blame -C100`, 474,664 lines (pull request body). The variant used for
+this check is not recorded. The git run of the same 199 files took 4,845.1
+CPU s (`tools/repoblame/RESULTS.md`).
 
 Full offline test suite: 3,036 pass, 0 fail, 42 skipped.
 
 ## Reading the source blobs of one commit
 
-The commit `a7666a37c8` changes 103,234 files. Reading the 103,031 source
-blobs of its parent (3.4 GB):
+The commit `a7666a37c8` changes 103,234 files
+(`tools/repoblame/RESULTS.md`). Reading its 103,031 source blobs (3.4 GB)
+(commit message of `07ac964ca`):
 
 | variant | time |
 |---|---|
-| bundled zlib | 18.1 s |
-| system zlib 1.3.2 | 18.1 s |
-| zlib-ng 2.3.3 (compat) | 11.5 s |
-| `git cat-file --batch` | 10.4 s user |
-| zlib-ng, LRU cache of 96 MB (this branch) | 10.5 s |
-| zlib-ng, LRU cache of 16 MB | 11.5 s |
-| zlib-ng, flush cache of 96 MB | 11.0 s |
+| before, zlib-ng | 11.5 s |
+| after, LRU cache of 96 MB, zlib-ng | 10.5 s |
+| LRU cache of 16 MB | 11.5 s |
+| cache of 96 MB without LRU | 11.0 s |
 
-A private `git_blame_cache` for one file is slower (file 71: 2.15 times
-git), so it is not used.
+The times of the bundled zlib and of `git cat-file --batch` are not
+recorded.
 
 ## Changes that reach every libgit2 user
 
