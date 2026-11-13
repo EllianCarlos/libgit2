@@ -1216,8 +1216,12 @@ static int find_copy_in_blob(
 	mmfile_t file_o;
 
 	if ((first = blame_nth_line(blame, ent->lno)) == NULL ||
-	    (end = blame_nth_line(blame, ent->lno + ent->num_lines)) == NULL)
+	    (end = blame_nth_line(blame, ent->lno + ent->num_lines)) == NULL) {
+		git_error_set(GIT_ERROR_INVALID,
+			"could not find the lines of a blame entry at line %"PRIuZ,
+			(size_t)ent->lno + 1);
 		return -1;
+	}
 
 	file_o.ptr = (char *)first;
 	file_o.size = (long)(end - first);
@@ -1228,8 +1232,12 @@ static int find_copy_in_blob(
 	data.split = split;
 
 	if (diff_hunks(*file_p, file_o, handle_split_cb, &data,
-			&blame->options) < 0)
+			&blame->options) < 0) {
+		if (git_error_last()->klass == GIT_ERROR_NONE)
+			git_error_set(GIT_ERROR_INVALID,
+				"could not diff the lines of a blame entry against the parent");
 		return -1;
+	}
 
 	/* The lines after the last difference are common, too. */
 	handle_split(blame, ent, data.tlno, data.plno, ent->num_lines,
