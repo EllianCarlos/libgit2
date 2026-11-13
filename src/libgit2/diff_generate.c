@@ -1256,6 +1256,67 @@ static int handle_matched_item(
 	return error;
 }
 
+#define DIFF_ITERATOR_TREE_SKIP \
+	(GIT_ITERATOR_INCLUDE_TREES | GIT_ITERATOR_DONT_AUTOEXPAND)
+
+static bool diff_can_skip_trees(git_iterator *a, git_iterator *b)
+{
+	return a->type == GIT_ITERATOR_TREE && b->type == GIT_ITERATOR_TREE &&
+	       (a->flags & DIFF_ITERATOR_TREE_SKIP) == DIFF_ITERATOR_TREE_SKIP &&
+	       (b->flags & DIFF_ITERATOR_TREE_SKIP) == DIFF_ITERATOR_TREE_SKIP;
+}
+
+/*
+ * In a diff of two trees whose iterators return the subtrees and do not
+ * expand them: skip a subtree that is the same on both sides, and go
+ * into the other subtrees.  Thus the handlers see the same files in the
+ * same order as with expanded iterators, less the unmodified files of
+ * the skipped subtrees, and they never see a tree.  A tree path ends
+ * with '/', so a tree never has the same path as a file.  Sets `*moved`
+ * when it advanced an iterator.
+ */
+static int diff_skip_or_enter_trees(
+	bool *moved, git_diff_generated *diff, diff_in_progress *info)
+{
+	bool otree = info->oitem && S_ISDIR(info->oitem->mode);
+	bool ntree = info->nitem && S_ISDIR(info->nitem->mode);
+	int cmp, error;
+
+	*moved = false;
+
+	if (!otree && !ntree)
+		return 0;
+
+	cmp = info->oitem ?
+		(info->nitem ? diff->base.entrycomp(info->oitem, info->nitem) : -1) : 1;
+
+	if (cmp == 0 && otree && ntree) {
+		*moved = true;
+
+		if (git_oid_equal(&info->oitem->id, &info->nitem->id)) {
+			if ((error = iterator_advance(&info->oitem, info->old_iter)) < 0)
+				return error;
+			return iterator_advance(&info->nitem, info->new_iter);
+		}
+
+		if ((error = iterator_advance_into(&info->oitem, info->old_iter)) < 0)
+			return error;
+		return iterator_advance_into(&info->nitem, info->new_iter);
+	}
+
+	if (otree && cmp <= 0) {
+		*moved = true;
+		return iterator_advance_into(&info->oitem, info->old_iter);
+	}
+
+	if (ntree && cmp >= 0) {
+		*moved = true;
+		return iterator_advance_into(&info->nitem, info->new_iter);
+	}
+
+	return 0;
+}
+
 int git_diff__from_iterators(
 	git_diff **out,
 	git_repository *repo,
@@ -1265,6 +1326,7 @@ int git_diff__from_iterators(
 {
 	git_diff_generated *diff;
 	diff_in_progress info = {0};
+	bool skip_trees, moved;
 	int error = 0;
 
 	*out = NULL;
@@ -1291,9 +1353,18 @@ int git_diff__from_iterators(
 		(error = iterator_current(&info.nitem, new_iter)) < 0)
 		goto cleanup;
 
+	skip_trees = diff_can_skip_trees(old_iter, new_iter);
+
 	/* run iterators building diffs */
 	while (!error && (info.oitem || info.nitem)) {
 		int cmp;
+
+		if (skip_trees) {
+			if ((error = diff_skip_or_enter_trees(&moved, diff, &info)) < 0)
+				break;
+			if (moved)
+				continue;
+		}
 
 		/* report progress */
 		if (opts && opts->progress_cb) {
@@ -1390,6 +1461,23 @@ int git_diff_tree_to_tree(
 	 */
 	if (opts && (opts->flags & GIT_DIFF_IGNORE_CASE) != 0)
 		iflag = GIT_ITERATOR_IGNORE_CASE;
+
+	/*
+	 * Return the subtrees and do not expand them, so that the diff can
+	 * skip the subtrees that are the same on both sides (see
+	 * diff_skip_or_enter_trees).  Only when that cannot change the
+	 * result: two trees (a missing tree has an empty iterator), no record
+	 * of unmodified files, no pathspec, no progress callback, and no
+	 * typechange records for trees.
+	 */
+	if (old_tree && new_tree &&
+	    (!opts ||
+	     ((opts->flags & (GIT_DIFF_INCLUDE_UNMODIFIED |
+	                      GIT_DIFF_IGNORE_CASE |
+	                      GIT_DIFF_INCLUDE_TYPECHANGE_TREES)) == 0 &&
+	      opts->pathspec.count == 0 &&
+	      opts->progress_cb == NULL)))
+		iflag |= GIT_ITERATOR_INCLUDE_TREES | GIT_ITERATOR_DONT_AUTOEXPAND;
 
 	if ((error = diff_prepare_iterator_opts(&prefix, &a_opts, iflag, &b_opts, iflag, opts)) < 0 ||
 	    (error = git_iterator_for_tree(&a, old_tree, &a_opts)) < 0 ||

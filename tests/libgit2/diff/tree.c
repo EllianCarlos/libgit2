@@ -1,5 +1,6 @@
 #include "clar_libgit2.h"
 #include "diff_helpers.h"
+#include "array.h"
 
 static git_repository *g_repo = NULL;
 static git_diff_options opts;
@@ -572,4 +573,99 @@ void test_diff_tree__diff_tree_with_empty_dir_entry_succeeds(void)
 
 	git_treebuilder_free(builder);
 	git_buf_dispose(&patch);
+}
+
+typedef git_array_t(git_tree *) tree_array;
+
+static void collect_trees(tree_array *trees, git_repository *repo)
+{
+	git_revwalk *walk;
+	git_oid id;
+	git_commit *commit;
+	git_tree **t;
+
+	cl_git_pass(git_revwalk_new(&walk, repo));
+	cl_git_pass(git_revwalk_push_glob(walk, "*"));
+
+	while (git_revwalk_next(&id, walk) == 0) {
+		cl_git_pass(git_commit_lookup(&commit, repo, &id));
+		t = git_array_alloc(*trees);
+		cl_assert(t);
+		cl_git_pass(git_commit_tree(t, commit));
+		git_commit_free(commit);
+	}
+
+	git_revwalk_free(walk);
+}
+
+static void assert_same_deltas_without_unmodified(
+	git_diff *expected, git_diff *actual)
+{
+	const git_diff_delta *e, *d;
+	size_t i, j = 0;
+
+	for (i = 0; i < git_diff_num_deltas(expected); i++) {
+		e = git_diff_get_delta(expected, i);
+		if (e->status == GIT_DELTA_UNMODIFIED)
+			continue;
+
+		cl_assert(j < git_diff_num_deltas(actual));
+		d = git_diff_get_delta(actual, j++);
+
+		cl_assert_equal_i(e->status, d->status);
+		cl_assert_equal_s(e->old_file.path, d->old_file.path);
+		cl_assert_equal_s(e->new_file.path, d->new_file.path);
+		cl_assert_equal_i(e->old_file.mode, d->old_file.mode);
+		cl_assert_equal_i(e->new_file.mode, d->new_file.mode);
+		cl_assert_equal_oid(&e->old_file.id, &d->old_file.id);
+		cl_assert_equal_oid(&e->new_file.id, &d->new_file.id);
+	}
+
+	cl_assert_equal_sz(j, git_diff_num_deltas(actual));
+}
+
+static void assert_skip_of_same_subtrees(const char *sandbox)
+{
+	tree_array trees = GIT_ARRAY_INIT;
+	uint32_t flags[] = { 0, GIT_DIFF_INCLUDE_TYPECHANGE };
+	git_diff_options all = GIT_DIFF_OPTIONS_INIT;
+	git_diff *expected, *actual;
+	size_t i, j, f;
+
+	g_repo = cl_git_sandbox_init(sandbox);
+	collect_trees(&trees, g_repo);
+	cl_assert(trees.size > 2);
+
+	for (f = 0; f < ARRAY_SIZE(flags); f++) {
+		opts.flags = flags[f];
+		all.flags = flags[f] | GIT_DIFF_INCLUDE_UNMODIFIED;
+
+		for (i = 0; i < trees.size; i++) {
+			for (j = 0; j < trees.size; j++) {
+				/* with unmodified records, the diff expands every subtree */
+				cl_git_pass(git_diff_tree_to_tree(&expected, g_repo,
+					trees.ptr[i], trees.ptr[j], &all));
+				cl_git_pass(git_diff_tree_to_tree(&actual, g_repo,
+					trees.ptr[i], trees.ptr[j], &opts));
+
+				assert_same_deltas_without_unmodified(expected, actual);
+
+				git_diff_free(expected);
+				git_diff_free(actual);
+			}
+		}
+	}
+
+	for (i = 0; i < trees.size; i++)
+		git_tree_free(trees.ptr[i]);
+	git_array_clear(trees);
+}
+
+void test_diff_tree__skips_only_unmodified_subtrees(void)
+{
+	assert_skip_of_same_subtrees("typechanges");
+	cl_git_sandbox_cleanup();
+	assert_skip_of_same_subtrees("testrepo.git");
+	cl_git_sandbox_cleanup();
+	assert_skip_of_same_subtrees("attr");
 }

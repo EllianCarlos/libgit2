@@ -69,9 +69,11 @@ struct git_pack_idx_header {
 };
 
 typedef struct git_pack_cache_entry {
-	size_t last_usage; /* enough? */
 	git_atomic32 refcount;
 	git_rawobj raw;
+	off64_t offset;
+	/* LRU list of the cache, most recently used first */
+	struct git_pack_cache_entry *lru_prev, *lru_next;
 } git_pack_cache_entry;
 
 struct pack_chain_elem {
@@ -83,7 +85,8 @@ struct pack_chain_elem {
 
 typedef git_array_t(struct pack_chain_elem) git_dependency_chain;
 
-#define GIT_PACK_CACHE_MEMORY_LIMIT 16 * 1024 * 1024
+/* The same as the default of git's core.deltaBaseCacheLimit */
+#define GIT_PACK_CACHE_MEMORY_LIMIT 96 * 1024 * 1024
 #define GIT_PACK_CACHE_SIZE_LIMIT 1024 * 1024 /* don't bother caching anything over 1MB */
 
 struct git_pack_entry {
@@ -100,9 +103,9 @@ GIT_HASHMAP_OID_PROTOTYPES(git_pack_oidmap, struct git_pack_entry *);
 typedef struct {
 	size_t memory_used;
 	size_t memory_limit;
-	size_t use_ctr;
 	git_mutex lock;
 	git_pack_offsetmap entries;
+	git_pack_cache_entry *lru_head, *lru_tail;
 } git_pack_cache;
 
 struct git_pack_file {
