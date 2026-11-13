@@ -2082,7 +2082,11 @@ static int blame_cache_sources(
 	error = blame_source_list_build(list, blame, target, parent, porigin,
 		opt, filters);
 
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		/* The list stays in the map: it cannot be touched without the lock. */
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return -1;
+	}
 	if (error < 0) {
 		blame_source_listmap_remove(&cache->lists, list->key);
 		blame_source_list_free(list);
