@@ -10,6 +10,7 @@
 #include "commit.h"
 #include "blob.h"
 #include "diff_xdiff.h"
+#include "hashmap_str.h"
 
 /*
  * Origin is refcounted and usually we keep the blob contents to be
@@ -521,8 +522,12 @@ static int pass_blame_to_parent(
 	fill_origin_blob(parent, &file_p);
 	fill_origin_blob(target, &file_o);
 
-	if (diff_hunks(file_p, file_o, my_emit, &d, &blame->options) < 0)
-		return -1;
+	{
+		int r;
+		r = diff_hunks(file_p, file_o, my_emit, &d, &blame->options);
+		if (r < 0)
+			return -1;
+	}
 
 	/* The reset (i.e. anything after tlno) are the same as the parent */
 	if (blame_chunk(blame, d.tlno, d.plno, last_in_target, target, parent) < 0)
@@ -769,6 +774,7 @@ static int rename_similarity(
 	    (double)delta_size * BLAME_RENAME_MAX_SCORE || !dst_size)
 		return 0;
 
+	error = 0;
 	if ((!src->counted && (error = count_chunks(src)) < 0) ||
 	    (!dst->counted && (error = count_chunks(dst)) < 0))
 		return error;
@@ -1246,6 +1252,356 @@ static int find_copy_in_blob(
 	return 0;
 }
 
+/* The line filters of the copy search; see git_blame_cache below. */
+
+#define BLAME_CACHE_DEFAULT_BYTES ((size_t)512 * 1024 * 1024)
+#define BLAME_FILTER_BITS_PER_ITEM 10
+#define BLAME_FILTER_MIN_BITS 64
+
+/*
+ * The filter has a single line only when the line scores above this;
+ * so the filter can prove a bound only for a threshold of this or more.
+ * Most lines of a tokenized file score less, and a filter without them
+ * is smaller.
+ */
+#define BLAME_FILTER_LINE_SCORE 16
+
+typedef struct {
+	git_oid id;
+	uint16_t mode;
+	bool filtered;   /* `bits` is valid */
+	bool no_filter;  /* never make a filter for this source */
+	uint32_t nbits;  /* the number of bits in `bits` */
+	uint64_t salt;   /* makes the bits of each filter different */
+	unsigned char *bits;
+	char *path;
+} blame_source;
+
+typedef struct {
+	char *key;
+	blame_source *sources;
+	size_t count;
+	size_t filters;
+	size_t bytes;
+	uint64_t last_use;
+	int refcount;   /* blames that use the list now */
+	bool ready;     /* made; before that, other blames wait */
+} blame_source_list;
+
+GIT_HASHMAP_STR_SETUP(blame_source_listmap, blame_source_list *);
+
+/*
+ * The lock protects the map, the counters, and the refcount and state
+ * of each list.  A list that is ready does not change until it is freed,
+ * so a blame reads it without the lock.
+ */
+struct git_blame_cache {
+	char *gitdir;
+	git_mutex lock;
+	git_cond ready;
+	blame_source_listmap lists;
+	uint64_t clock;
+	git_blame_cache_stats stats;
+};
+
+GIT_INLINE(uint64_t) blame_mix(uint64_t x)
+{
+	x ^= x >> 33;
+	x *= UINT64_C(0xff51afd7ed558ccd);
+	x ^= x >> 33;
+	x *= UINT64_C(0xc4ceb9fe1a85ec53);
+	x ^= x >> 33;
+	return x;
+}
+
+/* The hash of a line, without its newline. */
+static uint64_t blame_line_hash(const char *p, size_t len)
+{
+	uint64_t h = UINT64_C(0xcbf29ce484222325);
+
+	while (len--) {
+		h ^= (unsigned char)*p++;
+		h *= UINT64_C(0x100000001b3);
+	}
+	return blame_mix(h);
+}
+
+GIT_INLINE(uint64_t) blame_item_line(uint64_t h)
+{
+	return blame_mix(h ^ UINT64_C(0x9e3779b97f4a7c15));
+}
+
+GIT_INLINE(uint64_t) blame_item_pair(uint64_t a, uint64_t b)
+{
+	return blame_mix(a * UINT64_C(0x9e3779b97f4a7c15) + b);
+}
+
+/* Map 32 random bits to a bit of the filter, without a division. */
+GIT_INLINE(uint32_t) blame_filter_bit(const blame_source *s, uint32_t x)
+{
+	return (uint32_t)(((uint64_t)x * s->nbits) >> 32);
+}
+
+/* Three probes for each item, by double hashing. */
+#define BLAME_FILTER_PROBES 3
+
+/*
+ * Most sources of a big commit have most of their lines in common (they
+ * are generated).  Without a salt, a line that is a false positive in
+ * one filter would be a false positive in all of them, because the same
+ * common lines set the same bits.  A salt for each filter makes the
+ * false positives of different filters independent.
+ */
+GIT_INLINE(void) blame_filter_set(blame_source *s, uint64_t item)
+{
+	uint64_t x = blame_mix(item ^ s->salt);
+	uint32_t h1 = (uint32_t)x, h2 = (uint32_t)(x >> 32) | 1;
+	int i;
+
+	for (i = 0; i < BLAME_FILTER_PROBES; i++, h1 += h2) {
+		uint32_t b = blame_filter_bit(s, h1);
+		s->bits[b >> 3] |= (unsigned char)(1 << (b & 7));
+	}
+}
+
+GIT_INLINE(bool) blame_filter_test(const blame_source *s, uint64_t item)
+{
+	uint64_t x = blame_mix(item ^ s->salt);
+	uint32_t h1 = (uint32_t)x, h2 = (uint32_t)(x >> 32) | 1;
+	int i;
+
+	for (i = 0; i < BLAME_FILTER_PROBES; i++, h1 += h2) {
+		uint32_t b = blame_filter_bit(s, h1);
+		if (!(s->bits[b >> 3] & (1 << (b & 7))))
+			return false;
+	}
+	return true;
+}
+
+static int blame_u64_cmp(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return (x > y) - (x < y);
+}
+
+/*
+ * Split `buf` into lines like xdiff does (a last line without a newline
+ * is a line, too), and put the hash of each line, without its newline,
+ * in `*out`.
+ */
+static int blame_hash_lines(
+		uint64_t **out,
+		unsigned **scores_out,
+		size_t *count,
+		const char *buf,
+		size_t size)
+{
+	unsigned *sc = NULL;
+	const char *p = buf, *end = buf + size, *nl;
+	size_t n = 0, alloc = 0;
+	uint64_t *h = NULL;
+
+	*out = NULL;
+	*count = 0;
+
+	for (nl = p; nl < end; nl++)
+		if (*nl == '\n')
+			alloc++;
+	alloc++;
+
+	h = git__mallocarray(alloc, sizeof(uint64_t));
+	sc = git__mallocarray(alloc, sizeof(unsigned));
+	if (!h || !sc) {
+		git__free(h);
+		git__free(sc);
+		git_error_set_oom();
+		return -1;
+	}
+
+	while (p < end) {
+		const char *q;
+		unsigned score = 0;
+
+		nl = memchr(p, '\n', (size_t)(end - p));
+		if (!nl)
+			nl = end;
+		for (q = p; q < nl; q++) {
+			unsigned char ch = *((const unsigned char *)q);
+			if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			    (ch >= '0' && ch <= '9'))
+				score++;
+		}
+		sc[n] = score;
+		h[n++] = blame_line_hash(p, (size_t)(nl - p));
+		p = nl + 1;
+	}
+
+	*out = h;
+	*scores_out = sc;
+	*count = n;
+	return 0;
+}
+
+/* Make the filter of the lines of `s` from its contents. */
+static int blame_filter_build(
+		blame_source *s,
+		const char *buf,
+		size_t size)
+{
+	uint64_t *h = NULL, *items = NULL;
+	unsigned *sc = NULL;
+	size_t n, nitems = 0, distinct, i, nbits;
+	int error;
+
+	if ((error = blame_hash_lines(&h, &sc, &n, buf, size)) < 0)
+		return error;
+
+	items = git__mallocarray(n * 2 + 1, sizeof(uint64_t));
+	if (!items) {
+		git__free(h);
+		git__free(sc);
+		git_error_set_oom();
+		return -1;
+	}
+
+	for (i = 0; i < n; i++) {
+		if (1 + sc[i] > BLAME_FILTER_LINE_SCORE)
+			items[nitems++] = blame_item_line(h[i]);
+		if (i > 0)
+			items[nitems++] = blame_item_pair(h[i - 1], h[i]);
+	}
+
+	qsort(items, nitems, sizeof(uint64_t), blame_u64_cmp);
+	for (i = 0, distinct = 0; i < nitems; i++)
+		if (!i || items[i] != items[i - 1])
+			items[distinct++] = items[i];
+
+	nbits = distinct * BLAME_FILTER_BITS_PER_ITEM;
+	if (nbits < BLAME_FILTER_MIN_BITS)
+		nbits = BLAME_FILTER_MIN_BITS;
+	if (nbits > ((size_t)1 << 31))
+		nbits = (size_t)1 << 31;
+	nbits = (nbits + 7) & ~(size_t)7;
+
+	s->bits = git__calloc(nbits / 8, 1);
+	if (!s->bits) {
+		git__free(h);
+		git__free(sc);
+		git__free(items);
+		git_error_set_oom();
+		return -1;
+	}
+	s->nbits = (uint32_t)nbits;
+
+	for (i = 0; i < distinct; i++)
+		blame_filter_set(s, items[i]);
+
+	s->filtered = true;
+	git__free(h);
+	git__free(sc);
+	git__free(items);
+	return 0;
+}
+
+/* The lines of a candidate entry: their hashes and their scores. */
+typedef struct {
+	uint64_t *hash;
+	unsigned *score;
+	size_t count;
+} blame_entry_lines;
+
+static int blame_entry_lines_init(
+		blame_entry_lines *out,
+		git_blame *blame,
+		git_blame__entry *e)
+{
+	size_t i;
+
+	memset(out, 0, sizeof(*out));
+	out->hash = git__mallocarray(e->num_lines ? e->num_lines : 1,
+		sizeof(uint64_t));
+	out->score = git__mallocarray(e->num_lines ? e->num_lines : 1,
+		sizeof(unsigned));
+	GIT_ERROR_CHECK_ALLOC(out->hash);
+	GIT_ERROR_CHECK_ALLOC(out->score);
+
+	for (i = 0; i < e->num_lines; i++) {
+		const char *cp = blame_nth_line(blame, e->lno + i);
+		const char *ep = blame_nth_line(blame, e->lno + i + 1);
+		size_t len;
+		unsigned score = 0;
+
+		if (!cp || !ep)
+			return -1;
+
+		len = (size_t)(ep - cp);
+		if (len && cp[len - 1] == '\n')
+			len--;
+
+		out->hash[i] = blame_line_hash(cp, len);
+		for (; cp < ep; cp++) {
+			unsigned char ch = *((const unsigned char *)cp);
+			if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			    (ch >= '0' && ch <= '9'))
+				score++;
+		}
+		out->score[i] = score;
+	}
+
+	out->count = e->num_lines;
+	return 0;
+}
+
+static void blame_entry_lines_free(blame_entry_lines *l)
+{
+	git__free(l->hash);
+	git__free(l->score);
+}
+
+/*
+ * Whether the xdiff of the lines `l` against the source `s` can give a
+ * split that scores above `threshold`.  A split is one run of lines that
+ * the two files have in common, in the same order; the score of a split
+ * is 1 plus the letters and digits of its lines (see blame_entry_score).
+ * Each line of a run of two or more lines is in `s` together with the
+ * line after it, and a run of one line is in `s`.  So the best score of
+ * a run in which each pair of lines is in the filter, and of a single
+ * line that is in the filter, is an upper bound.  The filter has a
+ * single line only if it scores above BLAME_FILTER_LINE_SCORE; thus for
+ * a lower threshold the answer is always "can match".
+ */
+static bool blame_source_can_match(
+		const blame_source *s,
+		const blame_entry_lines *l,
+		unsigned threshold)
+{
+	size_t k, run_len = 0;
+	unsigned long run = 0;
+
+	if (threshold < BLAME_FILTER_LINE_SCORE)
+		return true;
+
+	for (k = 0; k < l->count; k++) {
+		if (k > 0 && run_len > 0 &&
+		    blame_filter_test(s, blame_item_pair(l->hash[k - 1],
+				l->hash[k]))) {
+			run += l->score[k];
+			run_len++;
+		} else {
+			run = l->score[k];
+			run_len = 1;
+		}
+
+		if (run_len >= 2 && 1 + run > threshold)
+			return true;
+		if (run_len == 1 && 1 + (unsigned long)l->score[k] > threshold &&
+		    blame_filter_test(s, blame_item_line(l->hash[k])))
+			return true;
+	}
+
+	return false;
+}
+
 /*
  * Find lines that `target` is still suspected for anywhere in the blob of
  * `parent`, the same file in a parent commit: this detects lines that
@@ -1263,9 +1619,10 @@ static int find_move_in_parent(
 {
 	unsigned threshold = blame_move_score(blame);
 	git_blame__entry *e, split[3];
+	blame_source filter;
 	size_t last_in_target;
 	mmfile_t file_p;
-	int error;
+	int error = 0;
 
 	if (!find_last_in_target(&last_in_target, blame, target))
 		return 1;
@@ -1274,11 +1631,43 @@ static int find_move_in_parent(
 	if (!file_p.ptr)
 		return 0;
 
+	/*
+	 * With a cache, skip the entries that the filter of the parent blob
+	 * proves cannot move there (see blame_source_can_match).
+	 */
+	memset(&filter, 0, sizeof(filter));
+	if (blame->cache &&
+	    !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE) &&
+	    (size_t)file_p.size <= GIT_XDIFF_MAX_SIZE &&
+	    (error = blame_filter_build(&filter, file_p.ptr,
+			(size_t)file_p.size)) < 0)
+		return error;
+
 	for (e = blame->ent; e; ) {
 		if (e->guilty || !same_suspect(e->suspect, target) ||
 		    blame_entry_score(blame, e) <= threshold) {
 			e = e->next;
 			continue;
+		}
+
+		if (filter.filtered) {
+			blame_entry_lines lines;
+			bool can_match;
+
+			if ((error = blame_entry_lines_init(&lines, blame, e)) < 0) {
+				blame_entry_lines_free(&lines);
+				break;
+			}
+			can_match = blame_source_can_match(&filter, &lines,
+				threshold);
+			blame_entry_lines_free(&lines);
+			blame->cache_counts.checks++;
+			if (!can_match) {
+				blame->cache_counts.pruned++;
+				e = e->next;
+				continue;
+			}
+			blame->cache_counts.xdiffs++;
 		}
 
 		memset(split, 0, sizeof(split));
@@ -1300,10 +1689,11 @@ static int find_move_in_parent(
 		decref_split(split);
 
 		if (error < 0)
-			return error;
+			break;
 	}
 
-	return 0;
+	git__free(filter.bits);
+	return error < 0 ? error : 0;
 }
 
 /* A blame entry that may have been copied, and its best split so far. */
@@ -1430,7 +1820,7 @@ static int make_source_origin(
  * Search every source file for the best match of every candidate, and
  * record it in the candidate.
  */
-static int find_best_copies(
+static int find_best_copies_in_diff(
 		git_blame *blame,
 		blame_copy_candidates *candidates,
 		git_commit *parent,
@@ -1438,7 +1828,7 @@ static int find_best_copies(
 		git_blame__origin *porigin)
 {
 	git_blame__entry potential[3];
-	git_blame__origin *norigin;
+	git_blame__origin *norigin = NULL;
 	blame_copy_candidate *c;
 	mmfile_t file_p;
 	size_t i, j;
@@ -1450,8 +1840,8 @@ static int find_best_copies(
 		if (!is_copy_source(delta, porigin))
 			continue;
 
-		if ((error = make_source_origin(&norigin, blame, parent,
-				delta)) < 0)
+		error = make_source_origin(&norigin, blame, parent, delta);
+		if (error < 0)
 			return error;
 
 		fill_origin_blob(norigin, &file_p);
@@ -1459,8 +1849,9 @@ static int find_best_copies(
 		git_array_foreach(*candidates, j, c) {
 			memset(potential, 0, sizeof(potential));
 
-			if ((error = find_copy_in_blob(blame, c->ent, norigin,
-					potential, &file_p)) == 0)
+			error = find_copy_in_blob(blame, c->ent, norigin,
+					potential, &file_p);
+			if (error == 0)
 				copy_split_if_better(blame, c->split, potential);
 
 			decref_split(potential);
@@ -1476,6 +1867,496 @@ static int find_best_copies(
 	}
 
 	return 0;
+}
+
+/*
+ * The cache that many blames of one repository share (experimental).
+ *
+ * The search for copied lines in a commit compares the lines of the
+ * target with every file that the commit changed, and it does so for
+ * each target file that the commit changed.  In a commit that changes
+ * 50,000 files, each of those files reads 50,000 blobs again.
+ *
+ * The cache keeps, for each (commit, parent) pair, the list of the copy
+ * sources, and for each source a filter of its lines: a Bloom filter of
+ * the hashes of its lines and of each pair of lines that follow one
+ * another.  A run of lines that the target and the source have in common
+ * is in the filter; so when no run of the target lines that the filter
+ * can have scores above the copy threshold, the xdiff of that source
+ * cannot give a split above the threshold, and the search skips it.  The
+ * filter can have false positives but no false negatives, thus the
+ * result does not change.
+ */
+
+static void blame_source_list_free(blame_source_list *list)
+{
+	size_t i;
+
+	if (!list)
+		return;
+
+	for (i = 0; i < list->count; i++) {
+		git__free(list->sources[i].bits);
+		git__free(list->sources[i].path);
+	}
+	git__free(list->sources);
+	git__free(list->key);
+	git__free(list);
+}
+
+/*
+ * Remove the least recently used list that no blame uses now.  The
+ * caller holds the lock.
+ */
+static bool blame_cache_evict(git_blame_cache *cache)
+{
+	git_hashmap_iter_t iter = GIT_HASHMAP_ITER_INIT;
+	blame_source_list *list, *lru = NULL;
+
+	while (blame_source_listmap_iterate(&iter, NULL, &list,
+			&cache->lists) == 0) {
+		if (list->ready && !list->refcount &&
+		    (!lru || list->last_use < lru->last_use))
+			lru = list;
+	}
+
+	if (!lru)
+		return false;
+
+	blame_source_listmap_remove(&cache->lists, lru->key);
+	cache->stats.bytes -= lru->bytes;
+	cache->stats.lists--;
+	cache->stats.list_evictions++;
+	blame_source_list_free(lru);
+	return true;
+}
+
+/*
+ * Make the list of sources, and the filter of each source: read every
+ * blob once.  This runs without the lock; `list` is not visible to
+ * other blames yet.
+ */
+static int blame_source_list_build(
+		blame_source_list *list,
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent,
+		git_blame__origin *porigin,
+		uint32_t opt,
+		bool filters)
+{
+	git_diff *diff = NULL;
+	size_t i;
+	int error;
+
+	if ((error = diff_copy_sources(&diff, blame, target, parent,
+			porigin, opt)) < 0)
+		return error;
+
+	list->sources = git__calloc(git_diff_num_deltas(diff) + 1,
+		sizeof(blame_source));
+	if (!list->sources) {
+		error = -1;
+		goto done;
+	}
+	list->bytes = sizeof(*list) + strlen(list->key) + 1 +
+		sizeof(blame_source);
+
+	for (i = 0; i < git_diff_num_deltas(diff); i++) {
+		const git_diff_delta *delta = git_diff_get_delta(diff, i);
+		blame_source *s;
+		git_blob *blob = NULL;
+
+		if (!is_copy_source(delta, NULL))
+			continue;
+
+		s = &list->sources[list->count];
+		git_oid_cpy(&s->id, &delta->old_file.id);
+		s->mode = delta->old_file.mode;
+		if ((s->path = git__strdup(delta->old_file.path)) == NULL) {
+			error = -1;
+			goto done;
+		}
+		list->count++;
+		list->bytes += sizeof(*s) + strlen(s->path) + 1;
+
+		if (!filters) {
+			s->no_filter = true;
+			continue;
+		}
+
+		error = git_blob_lookup(&blob, blame->repository, &s->id);
+		if (error < 0)
+			goto done;
+		blame->cache_counts.blob_loads++;
+
+		if (git_blob_rawsize(blob) > GIT_XDIFF_MAX_SIZE) {
+			s->no_filter = true;
+		} else {
+			memcpy(&s->salt, s->id.id, sizeof(s->salt));
+			error = blame_filter_build(s, git_blob_rawcontent(blob),
+				(size_t)git_blob_rawsize(blob));
+			if (error < 0) {
+				git_blob_free(blob);
+				goto done;
+			}
+			list->bytes += (size_t)s->nbits / 8;
+			list->filters++;
+		}
+		git_blob_free(blob);
+	}
+
+done:
+	git_diff_free(diff);
+	return error;
+}
+
+/*
+ * Get the list of the copy sources of `target` in `parent`, the same
+ * files as `diff_copy_sources` lists, in the same order, and hold it
+ * until blame_cache_release.  The list does not leave out the file of
+ * `porigin`; the caller does.  When another blame makes the same list
+ * at the same time, wait for it.
+ */
+static int blame_cache_sources(
+		blame_source_list **out,
+		git_blame *blame,
+		git_blame__origin *target,
+		git_commit *parent,
+		git_blame__origin *porigin,
+		uint32_t opt)
+{
+	git_blame_cache *cache = blame->cache;
+	bool filters = !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE);
+	char key[GIT_OID_MAX_HEXSIZE * 2 + 5];
+	blame_source_list *list = NULL;
+	size_t n;
+	int unmodified, error;
+
+	unmodified = (opt & GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES) ||
+		((opt & GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES) &&
+		 (!porigin || strcmp(target->path, porigin->path)));
+
+	git_oid_tostr(key, GIT_OID_MAX_HEXSIZE + 1,
+		git_commit_id(target->commit));
+	n = strlen(key);
+	key[n++] = ' ';
+	git_oid_tostr(key + n, GIT_OID_MAX_HEXSIZE + 1, git_commit_id(parent));
+	n = strlen(key);
+	key[n++] = ' ';
+	key[n++] = unmodified ? 'u' : 'm';
+	key[n++] = filters ? 'f' : 'n';
+	key[n] = '\0';
+
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return -1;
+	}
+
+	while (blame_source_listmap_get(&list, &cache->lists, key) == 0) {
+		if (list->ready) {
+			list->refcount++;
+			list->last_use = ++cache->clock;
+			cache->stats.list_hits++;
+			git_mutex_unlock(&cache->lock);
+			*out = list;
+			return 0;
+		}
+		/* Another blame makes this list now. */
+		git_cond_wait(&cache->ready, &cache->lock);
+	}
+
+	/* Make the list; other blames that want it wait. */
+	list = git__calloc(1, sizeof(*list));
+	if (!list || (list->key = git__strdup(key)) == NULL ||
+	    blame_source_listmap_put(&cache->lists, list->key, list) < 0) {
+		if (list)
+			git__free(list->key);
+		git__free(list);
+		git_mutex_unlock(&cache->lock);
+		git_error_set_oom();
+		return -1;
+	}
+	git_mutex_unlock(&cache->lock);
+
+	error = blame_source_list_build(list, blame, target, parent, porigin,
+		opt, filters);
+
+	if (git_mutex_lock(&cache->lock) < 0) {
+		/* The list stays in the map: it cannot be touched without the lock. */
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return -1;
+	}
+	if (error < 0) {
+		blame_source_listmap_remove(&cache->lists, list->key);
+		blame_source_list_free(list);
+		list = NULL;
+	} else {
+		/* The new list stays, even when it alone is above the limit. */
+		while (cache->stats.bytes + list->bytes > cache->stats.max_bytes &&
+		       blame_cache_evict(cache))
+			;
+		list->ready = true;
+		list->refcount = 1;
+		list->last_use = ++cache->clock;
+		cache->stats.bytes += list->bytes;
+		cache->stats.lists++;
+		cache->stats.list_misses++;
+		cache->stats.filters_built += list->filters;
+	}
+	git_cond_broadcast(&cache->ready);
+	git_mutex_unlock(&cache->lock);
+
+	*out = list;
+	return error;
+}
+
+static void blame_cache_release(git_blame_cache *cache, blame_source_list *list)
+{
+	if (!list)
+		return;
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
+	list->refcount--;
+	git_mutex_unlock(&cache->lock);
+}
+
+int git_blame__cache_check_repo(
+		git_blame_cache *cache,
+		git_repository *repo)
+{
+	if (!cache)
+		return 0;
+
+	if (strcmp(cache->gitdir, git_repository_path(repo)) != 0) {
+		git_error_set(GIT_ERROR_INVALID,
+			"the blame cache was made for another repository");
+		return -1;
+	}
+
+	return 0;
+}
+
+void git_blame__cache_merge_counts(git_blame *blame)
+{
+	git_blame_cache *cache = blame->cache;
+
+	if (!cache)
+		return;
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
+	cache->stats.source_checks += blame->cache_counts.checks;
+	cache->stats.source_pruned += blame->cache_counts.pruned;
+	cache->stats.source_xdiffs += blame->cache_counts.xdiffs;
+	cache->stats.blob_loads += blame->cache_counts.blob_loads;
+	git_mutex_unlock(&cache->lock);
+	memset(&blame->cache_counts, 0, sizeof(blame->cache_counts));
+}
+
+/*
+ * Like find_best_copies_in_diff, for a list from the cache.  The list
+ * is read only here, so blames in other threads can use it too.
+ *
+ * find_best_copies_in_diff keeps, for each candidate, the split with
+ * the highest score, and of those the one of the last source (a later
+ * split with the same score wins).  Here the search skips a (candidate,
+ * source) pair when the filter proves that the source cannot give a
+ * split above the threshold, or a split that scores at least as high as
+ * the best split of the candidate so far.  The sources come in the same
+ * order, so the result is the same.
+ */
+static int find_best_copies_in_list(
+		git_blame *blame,
+		blame_copy_candidates *candidates,
+		git_commit *parent,
+		blame_source_list *list,
+		git_blame__origin *porigin)
+{
+	unsigned threshold = blame_copy_score(blame);
+	bool prune = !(blame->options.flags & GIT_BLAME_IGNORE_WHITESPACE);
+	blame_entry_lines *lines = NULL;
+	unsigned *best = NULL;
+	git_blame__entry potential[3];
+	blame_copy_candidate *c;
+	size_t i, j, ncand = git_array_size(*candidates);
+	int error = 0;
+
+	lines = git__calloc(ncand ? ncand : 1, sizeof(*lines));
+	best = git__calloc(ncand ? ncand : 1, sizeof(*best));
+	if (!lines || !best) {
+		error = -1;
+		goto done;
+	}
+	if (prune) {
+		git_array_foreach(*candidates, j, c) {
+			if ((error = blame_entry_lines_init(&lines[j], blame,
+					c->ent)) < 0)
+				goto done;
+		}
+	}
+
+	for (i = 0; i < list->count; i++) {
+		const blame_source *s = &list->sources[i];
+		git_blame__origin *norigin = NULL;
+		mmfile_t file_p;
+
+		if (porigin && !strcmp(s->path, porigin->path))
+			continue;
+
+		git_array_foreach(*candidates, j, c) {
+			unsigned bar = threshold;
+
+			/* A later split with the same score wins: keep a tie. */
+			if (c->split[1].suspect && best[j] > bar)
+				bar = best[j] - 1;
+
+			blame->cache_counts.checks++;
+			if (prune && s->filtered &&
+			    !blame_source_can_match(s, &lines[j], bar)) {
+				blame->cache_counts.pruned++;
+				continue;
+			}
+
+			if (!norigin) {
+				git_commit *commit = NULL;
+				git_blob *blob = NULL;
+
+				error = git_blob_lookup(&blob,
+					blame->repository, &s->id);
+				if (error < 0)
+					break;
+				blame->cache_counts.blob_loads++;
+
+				if ((error = git_commit_dup(&commit, parent)) < 0 ||
+				    (error = new_origin(&norigin, commit, blob,
+						s->path, s->mode)) < 0) {
+					git_commit_free(commit);
+					git_blob_free(blob);
+					break;
+				}
+				fill_origin_blob(norigin, &file_p);
+			}
+
+			memset(potential, 0, sizeof(potential));
+			blame->cache_counts.xdiffs++;
+
+			error = find_copy_in_blob(blame, c->ent, norigin,
+					potential, &file_p);
+
+			if (error == 0 && potential[1].suspect) {
+				copy_split_if_better(blame, c->split, potential);
+				best[j] = blame_entry_score(blame, &c->split[1]);
+			}
+
+			decref_split(potential);
+
+			if (error < 0)
+				break;
+		}
+
+		origin_decref(norigin);
+
+		if (error < 0)
+			goto done;
+	}
+
+done:
+	if (lines) {
+		for (j = 0; j < ncand; j++)
+			blame_entry_lines_free(&lines[j]);
+	}
+	git__free(lines);
+	git__free(best);
+	return error;
+}
+
+int git_blame_cache_new(
+		git_blame_cache **out,
+		git_repository *repo,
+		size_t max_bytes)
+{
+	git_blame_cache *cache;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(repo);
+
+	cache = git__calloc(1, sizeof(*cache));
+	GIT_ERROR_CHECK_ALLOC(cache);
+
+	cache->gitdir = git__strdup(git_repository_path(repo));
+	if (!cache->gitdir) {
+		git__free(cache);
+		git_error_set_oom();
+		return -1;
+	}
+
+	if (git_mutex_init(&cache->lock) < 0 ||
+	    git_cond_init(&cache->ready) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to init the blame cache");
+		git__free(cache->gitdir);
+		git__free(cache);
+		return -1;
+	}
+
+	cache->stats.max_bytes = max_bytes ? max_bytes : BLAME_CACHE_DEFAULT_BYTES;
+	*out = cache;
+	return 0;
+}
+
+void git_blame_cache_free(git_blame_cache *cache)
+{
+	git_hashmap_iter_t iter = GIT_HASHMAP_ITER_INIT;
+	blame_source_list *list;
+
+	if (!cache)
+		return;
+
+	while (blame_source_listmap_iterate(&iter, NULL, &list,
+			&cache->lists) == 0)
+		blame_source_list_free(list);
+
+	blame_source_listmap_dispose(&cache->lists);
+	git_cond_free(&cache->ready);
+	git_mutex_free(&cache->lock);
+	git__free(cache->gitdir);
+	git__free(cache);
+}
+
+void git_blame_cache_get_stats(
+		git_blame_cache_stats *out,
+		const git_blame_cache *cache)
+{
+	git_blame_cache *c = (git_blame_cache *)cache;
+
+	if (!out || !cache)
+		return;
+	if (git_mutex_lock(&c->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		memset(out, 0, sizeof(*out));
+		return;
+	}
+	memcpy(out, &c->stats, sizeof(*out));
+	git_mutex_unlock(&c->lock);
+}
+
+static int find_best_copies(
+		git_blame *blame,
+		blame_copy_candidates *candidates,
+		git_commit *parent,
+		git_diff *diff,
+		blame_source_list *list,
+		git_blame__origin *porigin)
+{
+	if (list)
+		return find_best_copies_in_list(blame, candidates, parent,
+			list, porigin);
+
+	return find_best_copies_in_diff(blame, candidates, parent, diff,
+		porigin);
 }
 
 /*
@@ -1501,6 +2382,7 @@ static int find_copy_in_parent(
 	blame_copy_candidate *c;
 	git_blame__entry *e, *tail;
 	git_diff *diff = NULL;
+	blame_source_list *list = NULL;
 	size_t i;
 	int error = 0;
 
@@ -1516,13 +2398,18 @@ static int find_copy_in_parent(
 		goto done;
 	}
 
-	if ((error = diff_copy_sources(&diff, blame, target, parent,
-			porigin, opt)) < 0)
+	if (blame->cache)
+		error = blame_cache_sources(&list, blame, target, parent,
+			porigin, opt);
+	else
+		error = diff_copy_sources(&diff, blame, target, parent,
+			porigin, opt);
+	if (error < 0)
 		goto done;
 
 	while (git_array_size(candidates)) {
 		if ((error = find_best_copies(blame, &candidates, parent,
-				diff, porigin)) < 0)
+				diff, list, porigin)) < 0)
 			goto done;
 
 		git_array_foreach(candidates, i, c) {
@@ -1562,6 +2449,8 @@ done:
 	clear_copy_candidates(&candidates);
 	clear_copy_candidates(&next);
 	git_diff_free(diff);
+	if (list)
+		blame_cache_release(blame->cache, list);
 	return error;
 }
 
@@ -1606,10 +2495,11 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 			if ((error = git_commit_parent(&p, commit, i)) < 0)
 				goto finish;
 
-			if (pass == 0)
+			if (pass == 0) {
 				error = find_origin(&porigin, blame, p, origin);
-			else
+			} else {
 				error = find_rename(&porigin, blame, p, origin);
+			}
 
 			if (error < 0 || !porigin) {
 				/*

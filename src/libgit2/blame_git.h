@@ -18,5 +18,7 @@ int git_blame__get_origin(
 		const char *path);
 void git_blame__free_entry(git_blame__entry *ent);
 int git_blame__like_git(git_blame *sb, uint32_t flags);
+int git_blame__cache_check_repo(git_blame_cache *cache, git_repository *repo);
+void git_blame__cache_merge_counts(git_blame *blame);
 
 #endif

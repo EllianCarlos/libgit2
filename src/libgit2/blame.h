@@ -4,6 +4,7 @@
 #include "common.h"
 
 #include "git2/blame.h"
+#include "git2/sys/blame.h"
 #include "vector.h"
 #include "diff.h"
 #include "array.h"
@@ -65,6 +66,11 @@ typedef struct git_blame__entry {
 	bool is_boundary;
 } git_blame__entry;
 
+/* Counters of one blame that go to the cache at the end. */
+typedef struct {
+	size_t checks, pruned, xdiffs, blob_loads;
+} git_blame__cache_counts;
+
 struct git_blame {
 	char *path;
 	git_repository *repository;
@@ -86,6 +92,10 @@ struct git_blame {
 	int num_lines;
 	const char *final_buf;
 	size_t final_buf_size;
+
+	/* Shared work between blames of the same repository, or NULL. */
+	git_blame_cache *cache;
+	git_blame__cache_counts cache_counts;
 };
 
 git_blame *git_blame__alloc(
