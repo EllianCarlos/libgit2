@@ -34,7 +34,6 @@ static int hunk_byfinalline_search_cmp(const void *key, const void *entry)
 	return 0;
 }
 
-static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
 static int hunk_cmp(const void *_a, const void *_b)
 {
 	git_blame_hunk *a = (git_blame_hunk*)_a,
@@ -149,9 +148,7 @@ git_blame *git_blame__alloc(
 	gbr->options = opts;
 
 	if (git_vector_init(&gbr->hunks, 8, hunk_cmp) < 0 ||
-	    git_vector_init(&gbr->paths, 8, paths_cmp) < 0 ||
-	    (gbr->path = git__strdup(path)) == NULL ||
-	    git_vector_insert(&gbr->paths, git__strdup(path)) < 0) {
+	    (gbr->path = git__strdup(path)) == NULL) {
 		git_blame_free(gbr);
 		return NULL;
 	}
@@ -177,8 +174,6 @@ void git_blame_free(git_blame *blame)
 
 	git_vector_dispose(&blame->hunks);
 	git_array_clear(blame->lines);
-
-	git_vector_dispose_deep(&blame->paths);
 
 	git_array_clear(blame->line_index);
 

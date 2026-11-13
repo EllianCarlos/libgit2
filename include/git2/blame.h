@@ -34,33 +34,37 @@ typedef enum {
 	GIT_BLAME_NORMAL = 0,
 
 	/**
-	 * Track lines that have moved within a file (like `git blame -M`).
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * Track lines that have moved or been copied within a file (like
+	 * `git blame -M`).  When a commit changes a file, lines that it
+	 * seems to add are searched for anywhere in the parent's version
+	 * of the same file.  They are blamed on the parent when a match
+	 * has more than `min_match_characters` alphanumeric characters
+	 * (20 by default).
 	 */
 	GIT_BLAME_TRACK_COPIES_SAME_FILE = (1<<0),
 
 	/**
-	 * Track lines that have moved across files in the same commit
-	 * (like `git blame -C`).
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * Track lines that have moved or been copied from other files that
+	 * the same commit modified or deleted (like `git blame -C`).  They
+	 * are blamed on the parent's version of the other file when a
+	 * match has more than `min_match_characters` alphanumeric
+	 * characters (40 by default).  Implies SAME_FILE.
 	 */
 	GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES = (1<<1),
 
 	/**
-	 * Track lines that have been copied from another file that exists
-	 * in the same commit (like `git blame -CC`).  Implies SAME_FILE.
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * In addition, when the commit creates the file (or renames it),
+	 * track lines that have been copied from any file of the parent
+	 * commit, modified or not (like `git blame -C -C`).  Implies
+	 * SAME_COMMIT_MOVES.
 	 */
 	GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES = (1<<2),
 
 	/**
-	 * Track lines that have been copied from another file that exists in
-	 * *any* commit (like `git blame -CCC`).  Implies SAME_COMMIT_COPIES.
-	 *
-	 * This is not yet implemented and reserved for future use.
+	 * In addition, for every commit that changes the file, track lines
+	 * that have been copied from any file of the parent commit,
+	 * modified or not (like `git blame -C -C -C`).  Implies
+	 * SAME_COMMIT_COPIES.
 	 */
 	GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES = (1<<3),
 
@@ -100,9 +104,17 @@ typedef struct git_blame_options {
 
 	/**
 	 * The lower bound on the number of alphanumeric characters that
-	 * must be detected as moving/copying within a file for it to
-	 * associate those lines with the parent commit. The default value
-	 * is 20.
+	 * must be detected as moving/copying for it to associate those
+	 * lines with the parent commit.  Only ASCII letters and digits
+	 * count.
+	 *
+	 * With `GIT_BLAME_TRACK_COPIES_SAME_FILE` alone, this is the bound
+	 * for lines moved within a file (like `git blame -M<num>`); the
+	 * default value is 20.  With any flag that tracks copies from other
+	 * files, this is the bound for lines from other files (like
+	 * `git blame -C<num>`); the default value is 40, and lines moved
+	 * within a file keep the default bound of 20.  A value of 0 selects
+	 * the defaults.
 	 *
 	 * This value only takes effect if any of the `GIT_BLAME_TRACK_COPIES_*`
 	 * flags are specified.
@@ -186,14 +198,14 @@ typedef struct git_blame_hunk {
 
 	/**
 	 * The OID of the commit where this hunk was found.
-	 * This will usually be the same as `final_commit_id`, except when
-	 * `GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES` has been specified.
+	 * This is the same as `final_commit_id`.
 	 */
 	git_oid orig_commit_id;
 
 	/**
 	 * The path to the file where this hunk originated, as of the commit
-	 * specified by `orig_commit_id`.
+	 * specified by `orig_commit_id`.  With the `GIT_BLAME_TRACK_COPIES_*`
+	 * flags, this can be another file than the one that is blamed.
 	 */
 	const char *orig_path;
 

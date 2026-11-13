@@ -17,6 +17,7 @@ typedef struct git_blame__origin {
 	struct git_blame__origin *previous;
 	git_commit *commit;
 	git_blob *blob;
+	uint16_t mode;
 	char path[GIT_FLEX_ARRAY];
 } git_blame__origin;
 
@@ -72,7 +73,6 @@ struct git_blame {
 
 	git_vector hunks;
 	git_array_t(git_blame_line) lines;
-	git_vector paths;
 
 	git_blob *final_blob;
 	git_array_t(size_t) line_index;

@@ -1,6 +1,4 @@
-#include "clar_libgit2.h"
-
-#include "blame.h"
+#include "blame_helpers.h"
 
 
 /**
@@ -31,49 +29,88 @@ void test_blame_harder__cleanup(void)
 
 
 
+static void check_b_txt(git_blame *blame, bool copies)
+{
+	cl_assert_equal_i(4, git_blame_hunkcount(blame));
+
+	if (copies) {
+		check_blame_hunk_index(g_repo, blame, 0, 1, 4, 1,
+			"b99f7ac", "a.txt");
+		check_blame_hunk_index(g_repo, blame, 1, 5, 1, 1,
+			"b99f7ac", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 2, 6, 5, 1,
+			"b99f7ac", "a.txt");
+	} else {
+		check_blame_hunk_index(g_repo, blame, 0, 1, 4, 0,
+			"da23739", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 1, 5, 1, 1,
+			"b99f7ac", "b.txt");
+		check_blame_hunk_index(g_repo, blame, 2, 6, 5, 0,
+			"63d671e", "b.txt");
+	}
+
+	check_blame_hunk_index(g_repo, blame, 3, 11, 5, 0, "aa06ecc", "b.txt");
+}
+
 void test_blame_harder__m(void)
 {
-	/* TODO */
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
+	/* No line of b.txt moved within b.txt. */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_FILE;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, false);
+	git_blame_free(blame);
 }
 
 
 void test_blame_harder__c(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the first hunk in b.txt to (E), since it was cut/pasted from
-	 * a.txt in (D).
+	/*
+	 * Attribute the first hunk in b.txt to (E), since it was cut/pasted
+	 * from a.txt in (D).  Attribute the third hunk to (E) too: (C)
+	 * copied it from a.txt, which (C) also modified.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_MOVES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	cl_assert_equal_i(22,
+		git_blame_hunk_byindex(blame, 0)->orig_start_line_number);
+	cl_assert_equal_i(7,
+		git_blame_hunk_byindex(blame, 2)->orig_start_line_number);
+	git_blame_free(blame);
 }
 
 void test_blame_harder__cc(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the second hunk in b.txt to (E), since it was copy/pasted from
-	 * a.txt in (C).
+	/*
+	 * The same as above: all the copies came from a.txt, which the
+	 * commits that copied them also modified.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	git_blame_free(blame);
 }
 
 void test_blame_harder__ccc(void)
 {
+	git_blame *blame;
 	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-	GIT_UNUSED(opts);
-
-	/* Attribute the third hunk in b.txt to (E).  This hunk was deleted from
-	 * a.txt in (D), but reintroduced in (B).
+	/*
+	 * The fourth hunk in b.txt stays with (B): its lines are not in
+	 * any file of (D), the parent of (B), like `git blame -C -C -C`.
 	 */
 	opts.flags = GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES;
+	cl_git_pass(git_blame_file(&blame, g_repo, "b.txt", &opts));
+	check_b_txt(blame, true);
+	git_blame_free(blame);
 }
