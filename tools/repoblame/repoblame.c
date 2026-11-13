@@ -155,12 +155,12 @@ static void print_stats(FILE *f, git_blame_cache *cache)
 		return;
 	git_blame_cache_get_stats(&st, cache);
 	fprintf(f, "# cache bytes=%zu max=%zu lists=%zu hits=%zu misses=%zu "
-		"evictions=%zu filters=%zu filters_skipped=%zu checks=%zu "
+		"evictions=%zu filters=%zu checks=%zu "
 		"pruned=%zu xdiffs=%zu blob_loads=%zu\n",
 		st.bytes, st.max_bytes, st.lists, st.list_hits,
 		st.list_misses, st.list_evictions, st.filters_built,
-		st.filters_skipped, st.source_checks, st.source_pruned,
-		st.source_xdiffs, st.blob_loads);
+		st.source_checks, st.source_pruned, st.source_xdiffs,
+		st.blob_loads);
 }
 
 int main(int argc, char **argv)
@@ -275,10 +275,15 @@ int main(int argc, char **argv)
 	fprintf(stats, "idx\tpass\tthread\twall_s\tcpu_s\tlines\trc\tlist_misses\n");
 
 	threads = calloc((size_t)nthreads, sizeof(*threads));
+	if (!threads) {
+		perror("calloc");
+		return 1;
+	}
 	for (t = 0; t < nthreads; t++)
 		pthread_create(&threads[t], NULL, worker, (void *)(size_t)t);
 	for (t = 0; t < nthreads; t++)
 		pthread_join(threads[t], NULL);
+	free(threads);
 
 	print_stats(stats, cache);
 	git_blame_cache_free(cache);

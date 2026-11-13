@@ -511,6 +511,9 @@ int git_blame_file_cached(
 	if ((error = normalize_options(&normOptions, options, repo)) < 0)
 		goto on_error;
 
+	if ((error = git_blame__cache_check_repo(cache, repo)) < 0)
+		goto on_error;
+
 	blame = git_blame__alloc(repo, normOptions, path);
 	GIT_ERROR_CHECK_ALLOC(blame);
 	blame->cache = cache;

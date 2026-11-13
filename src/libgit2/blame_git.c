@@ -12,76 +12,6 @@
 #include "diff_xdiff.h"
 #include "hashmap_str.h"
 
-#ifdef GIT_BLAME_PROFILE
-/*
- * Measurement only: phase timers and counters for one process.  They are
- * not thread safe.  Set GIT_BLAME_PROFILE_LOG to a file name to get one
- * line per copy search and per rename search, and one total per blame.
- */
-#include <time.h>
-
-extern double xdl_prof_prepare_s;
-double xdl_prof_prepare_s;
-
-enum {
-	P_FIND_ORIGIN, P_PARENT_XDIFF, P_MOVE_XDIFF, P_RENAME_DIFF,
-	P_RENAME_LOAD, P_RENAME_COUNT, P_COPY_DIFF, P_COPY_LOAD,
-	P_COPY_XDIFF, P_FILTER, P_NPHASES
-};
-static const char *prof_names[P_NPHASES] = {
-	"find_origin", "parent_xdiff", "move_xdiff", "rename_diff",
-	"rename_load", "rename_count", "copy_diff", "copy_load", "copy_xdiff",
-	"filter_build"
-};
-static double prof_t[P_NPHASES], prof_prep[P_NPHASES];
-static size_t prof_copy_searches, prof_copy_deltas, prof_copy_sources,
-	prof_copy_bytes, prof_copy_xdiffs, prof_copy_useful, prof_rename_inexact,
-	prof_rename_srcs, prof_rename_bytes;
-
-static double prof_now(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-static size_t prof_prune_violations;
-
-/* GIT_BLAME_CHECK_PRUNE=1: run xdiff for each skipped source, too. */
-static int prof_check_prune(void)
-{
-	static int v = -1;
-	if (v < 0)
-		v = getenv("GIT_BLAME_CHECK_PRUNE") != NULL;
-	return v;
-}
-
-static FILE *prof_log(void)
-{
-	static FILE *f;
-	static int tried;
-	const char *p;
-
-	if (!tried) {
-		tried = 1;
-		if ((p = getenv("GIT_BLAME_PROFILE_LOG")) != NULL)
-			f = fopen(p, "a");
-	}
-	return f;
-}
-
-# define PROF_VARS double prof_t0, prof_p0
-# define PROF_START() (prof_t0 = prof_now(), prof_p0 = xdl_prof_prepare_s)
-# define PROF_STOP(ph) (prof_t[ph] += prof_now() - prof_t0, \
-	prof_prep[ph] += xdl_prof_prepare_s - prof_p0)
-# define PROF_COUNT(c, n) ((c) += (n))
-#else
-# define PROF_VARS int prof_unused_ = 0
-# define PROF_START() (void)prof_unused_
-# define PROF_STOP(ph) (void)prof_unused_
-# define PROF_COUNT(c, n) (void)0
-#endif
-
 /*
  * Origin is refcounted and usually we keep the blob contents to be
  * reused.
@@ -594,10 +524,7 @@ static int pass_blame_to_parent(
 
 	{
 		int r;
-		PROF_VARS;
-		PROF_START();
 		r = diff_hunks(file_p, file_o, my_emit, &d, &blame->options);
-		PROF_STOP(P_PARENT_XDIFF);
 		if (r < 0)
 			return -1;
 	}
@@ -862,17 +789,10 @@ static int rename_similarity(
 	    (double)delta_size * BLAME_RENAME_MAX_SCORE || !dst_size)
 		return 0;
 
-	{
-		PROF_VARS;
-		PROF_START();
-		error = 0;
-		if ((!src->counted && (error = count_chunks(src)) < 0) ||
-		    (!dst->counted && (error = count_chunks(dst)) < 0)) {
-			PROF_STOP(P_RENAME_COUNT);
-			return error;
-		}
-		PROF_STOP(P_RENAME_COUNT);
-	}
+	error = 0;
+	if ((!src->counted && (error = count_chunks(src)) < 0) ||
+	    (!dst->counted && (error = count_chunks(dst)) < 0))
+		return error;
 
 	while (i < src->counts.size && j < dst->counts.size) {
 		blame_chunk_count *s = &src->counts.ptr[i],
@@ -960,11 +880,9 @@ static int find_inexact_rename(
 	blame_rename_file target, *src, *same_base = NULL;
 	size_t i, j, same_base_count = 0, best, worst;
 	int score, error;
-	PROF_VARS;
 
 	*out = NULL;
 	memset(slots, 0, sizeof(slots));
-	PROF_START();
 
 	if ((error = load_rename_file(&target, blame->repository, dst,
 			&dst->new_file)) < 0)
@@ -987,19 +905,7 @@ static int find_inexact_rename(
 			srcs.size--;
 			goto done;
 		}
-		PROF_COUNT(prof_rename_bytes, git_blob_rawsize(src->blob));
 	}
-	PROF_STOP(P_RENAME_LOAD);
-	PROF_COUNT(prof_rename_srcs, git_array_size(srcs));
-	PROF_COUNT(prof_rename_inexact, 1);
-#ifdef GIT_BLAME_PROFILE
-	if (prof_log()) {
-		char a[GIT_OID_MAX_HEXSIZE + 1];
-		git_oid_tostr(a, sizeof(a), &dst->new_file.id);
-		fprintf(prof_log(), "R %s %zu %.6f\n", a,
-			git_array_size(srcs), prof_now() - prof_t0);
-	}
-#endif
 
 	git_array_foreach(srcs, i, src) {
 		if (same_basename(src->delta->old_file.path,
@@ -1069,7 +975,6 @@ static int find_rename(
 	git_blob *blob = NULL;
 	size_t i;
 	int error;
-	PROF_VARS;
 
 	*out = NULL;
 
@@ -1077,7 +982,6 @@ static int find_rename(
 	diffopts.flags = GIT_DIFF_SKIP_BINARY_CHECK |
 	                 GIT_DIFF_INCLUDE_TYPECHANGE;
 
-	PROF_START();
 	if ((error = git_commit_tree(&otree, origin->commit)) < 0 ||
 	    (error = git_commit_tree(&ptree, parent)) < 0 ||
 	    (error = git_diff_tree_to_tree(&diff, blame->repository,
@@ -1094,8 +998,6 @@ static int find_rename(
 			break;
 		}
 	}
-
-	PROF_STOP(P_RENAME_DIFF);
 
 	if (!dst)
 		goto done;
@@ -1335,8 +1237,12 @@ static int find_copy_in_blob(
 	mmfile_t file_o;
 
 	if ((first = blame_nth_line(blame, ent->lno)) == NULL ||
-	    (end = blame_nth_line(blame, ent->lno + ent->num_lines)) == NULL)
+	    (end = blame_nth_line(blame, ent->lno + ent->num_lines)) == NULL) {
+		git_error_set(GIT_ERROR_INVALID,
+			"could not find the lines of a blame entry at line %"PRIuZ,
+			(size_t)ent->lno + 1);
 		return -1;
+	}
 
 	file_o.ptr = (char *)first;
 	file_o.size = (long)(end - first);
@@ -1347,8 +1253,12 @@ static int find_copy_in_blob(
 	data.split = split;
 
 	if (diff_hunks(*file_p, file_o, handle_split_cb, &data,
-			&blame->options) < 0)
+			&blame->options) < 0) {
+		if (git_error_last()->klass == GIT_ERROR_NONE)
+			git_error_set(GIT_ERROR_INVALID,
+				"could not diff the lines of a blame entry against the parent");
 		return -1;
+	}
 
 	/* The lines after the last difference are common, too. */
 	handle_split(blame, ent, data.tlno, data.plno, ent->num_lines,
@@ -1401,7 +1311,7 @@ GIT_HASHMAP_STR_SETUP(blame_source_listmap, blame_source_list *);
  * so a blame reads it without the lock.
  */
 struct git_blame_cache {
-	git_repository *repo;
+	char *gitdir;
 	git_mutex lock;
 	git_cond ready;
 	blame_source_listmap lists;
@@ -1593,6 +1503,7 @@ static int blame_filter_build(
 		git__free(h);
 		git__free(sc);
 		git__free(items);
+		git_error_set_oom();
 		return -1;
 	}
 	s->nbits = (uint32_t)nbits;
@@ -1768,20 +1679,6 @@ static int find_move_in_parent(
 			blame->cache_counts.checks++;
 			if (!can_match) {
 				blame->cache_counts.pruned++;
-#ifdef GIT_BLAME_PROFILE
-				if (prof_check_prune()) {
-					memset(split, 0, sizeof(split));
-					if (find_copy_in_blob(blame, e, parent, split,
-							&file_p) == 0 && split[1].suspect &&
-					    blame_entry_score(blame, &split[1]) > threshold) {
-						prof_prune_violations++;
-						fprintf(stderr, "PRUNE VIOLATION (move) %s lno=%zu n=%zu score=%u\n",
-							parent->path, e->lno, e->num_lines,
-							blame_entry_score(blame, &split[1]));
-					}
-					decref_split(split);
-				}
-#endif
 				e = e->next;
 				continue;
 			}
@@ -1790,12 +1687,7 @@ static int find_move_in_parent(
 
 		memset(split, 0, sizeof(split));
 
-		{
-			PROF_VARS;
-			PROF_START();
-			error = find_copy_in_blob(blame, e, parent, split, &file_p);
-			PROF_STOP(P_MOVE_XDIFF);
-		}
+		error = find_copy_in_blob(blame, e, parent, split, &file_p);
 
 		if (!error && split[1].suspect &&
 		    blame_entry_score(blame, &split[1]) > threshold) {
@@ -1956,7 +1848,6 @@ static int find_best_copies_in_diff(
 	mmfile_t file_p;
 	size_t i, j;
 	int error = 0;
-	PROF_VARS;
 
 	for (i = 0; i < git_diff_num_deltas(diff); i++) {
 		const git_diff_delta *delta = git_diff_get_delta(diff, i);
@@ -1964,30 +1855,17 @@ static int find_best_copies_in_diff(
 		if (!is_copy_source(delta, porigin))
 			continue;
 
-		PROF_START();
 		error = make_source_origin(&norigin, blame, parent, delta);
-		PROF_STOP(P_COPY_LOAD);
 		if (error < 0)
 			return error;
-		PROF_COUNT(prof_copy_sources, 1);
-		PROF_COUNT(prof_copy_bytes, git_blob_rawsize(norigin->blob));
 
 		fill_origin_blob(norigin, &file_p);
 
 		git_array_foreach(*candidates, j, c) {
 			memset(potential, 0, sizeof(potential));
 
-			PROF_START();
 			error = find_copy_in_blob(blame, c->ent, norigin,
 					potential, &file_p);
-			PROF_STOP(P_COPY_XDIFF);
-			PROF_COUNT(prof_copy_xdiffs, 1);
-#ifdef GIT_BLAME_PROFILE
-			if (!error && potential[1].suspect &&
-			    blame_entry_score(blame, &potential[1]) >
-			    blame_copy_score(blame))
-				prof_copy_useful++;
-#endif
 			if (error == 0)
 				copy_split_if_better(blame, c->split, potential);
 
@@ -2085,7 +1963,6 @@ static int blame_source_list_build(
 	git_diff *diff = NULL;
 	size_t i;
 	int error;
-	PROF_VARS;
 
 	if ((error = diff_copy_sources(&diff, blame, target, parent,
 			porigin, opt)) < 0)
@@ -2123,23 +2000,17 @@ static int blame_source_list_build(
 			continue;
 		}
 
-		PROF_START();
 		error = git_blob_lookup(&blob, blame->repository, &s->id);
-		PROF_STOP(P_COPY_LOAD);
 		if (error < 0)
 			goto done;
 		blame->cache_counts.blob_loads++;
-		PROF_COUNT(prof_copy_sources, 1);
-		PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
 
 		if (git_blob_rawsize(blob) > GIT_XDIFF_MAX_SIZE) {
 			s->no_filter = true;
 		} else {
 			memcpy(&s->salt, s->id.id, sizeof(s->salt));
-			PROF_START();
 			error = blame_filter_build(s, git_blob_rawcontent(blob),
 				(size_t)git_blob_rawsize(blob));
-			PROF_STOP(P_FILTER);
 			if (error < 0) {
 				git_blob_free(blob);
 				goto done;
@@ -2226,7 +2097,11 @@ static int blame_cache_sources(
 	error = blame_source_list_build(list, blame, target, parent, porigin,
 		opt, filters);
 
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		/* The list stays in the map: it cannot be touched without the lock. */
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return -1;
+	}
 	if (error < 0) {
 		blame_source_listmap_remove(&cache->lists, list->key);
 		blame_source_list_free(list);
@@ -2255,9 +2130,28 @@ static void blame_cache_release(git_blame_cache *cache, blame_source_list *list)
 {
 	if (!list)
 		return;
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
 	list->refcount--;
 	git_mutex_unlock(&cache->lock);
+}
+
+int git_blame__cache_check_repo(
+		git_blame_cache *cache,
+		git_repository *repo)
+{
+	if (!cache)
+		return 0;
+
+	if (strcmp(cache->gitdir, git_repository_path(repo)) != 0) {
+		git_error_set(GIT_ERROR_INVALID,
+			"the blame cache was made for another repository");
+		return -1;
+	}
+
+	return 0;
 }
 
 void git_blame__cache_merge_counts(git_blame *blame)
@@ -2266,7 +2160,10 @@ void git_blame__cache_merge_counts(git_blame *blame)
 
 	if (!cache)
 		return;
-	git_mutex_lock(&cache->lock);
+	if (git_mutex_lock(&cache->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		return;
+	}
 	cache->stats.source_checks += blame->cache_counts.checks;
 	cache->stats.source_pruned += blame->cache_counts.pruned;
 	cache->stats.source_xdiffs += blame->cache_counts.xdiffs;
@@ -2302,7 +2199,6 @@ static int find_best_copies_in_list(
 	blame_copy_candidate *c;
 	size_t i, j, ncand = git_array_size(*candidates);
 	int error = 0;
-	PROF_VARS;
 
 	lines = git__calloc(ncand ? ncand : 1, sizeof(*lines));
 	best = git__calloc(ncand ? ncand : 1, sizeof(*best));
@@ -2337,33 +2233,6 @@ static int find_best_copies_in_list(
 			if (prune && s->filtered &&
 			    !blame_source_can_match(s, &lines[j], bar)) {
 				blame->cache_counts.pruned++;
-#ifdef GIT_BLAME_PROFILE
-				/* Check mode: the skipped xdiff must not beat `bar`. */
-				if (prof_check_prune()) {
-					git_blame__origin *o = NULL;
-					git_commit *pc = NULL;
-					git_blob *pb = NULL;
-					mmfile_t fp;
-
-					memset(potential, 0, sizeof(potential));
-					if (git_commit_dup(&pc, parent) == 0 &&
-					    git_blob_lookup(&pb, blame->repository, &s->id) == 0 &&
-					    new_origin(&o, pc, pb, s->path, s->mode) == 0) {
-						fill_origin_blob(o, &fp);
-						if (find_copy_in_blob(blame, c->ent, o,
-								potential, &fp) == 0 &&
-						    potential[1].suspect &&
-						    blame_entry_score(blame, &potential[1]) > bar) {
-							prof_prune_violations++;
-							fprintf(stderr, "PRUNE VIOLATION (copy) %s lno=%zu n=%zu score=%u bar=%u\n",
-								s->path, c->ent->lno, c->ent->num_lines,
-								blame_entry_score(blame, &potential[1]), bar);
-						}
-						decref_split(potential);
-						origin_decref(o);
-					}
-				}
-#endif
 				continue;
 			}
 
@@ -2371,15 +2240,11 @@ static int find_best_copies_in_list(
 				git_commit *commit = NULL;
 				git_blob *blob = NULL;
 
-				PROF_START();
 				error = git_blob_lookup(&blob,
 					blame->repository, &s->id);
-				PROF_STOP(P_COPY_LOAD);
 				if (error < 0)
 					break;
 				blame->cache_counts.blob_loads++;
-				PROF_COUNT(prof_copy_sources, 1);
-				PROF_COUNT(prof_copy_bytes, git_blob_rawsize(blob));
 
 				if ((error = git_commit_dup(&commit, parent)) < 0 ||
 				    (error = new_origin(&norigin, commit, blob,
@@ -2394,25 +2259,10 @@ static int find_best_copies_in_list(
 			memset(potential, 0, sizeof(potential));
 			blame->cache_counts.xdiffs++;
 
-			PROF_START();
 			error = find_copy_in_blob(blame, c->ent, norigin,
 					potential, &file_p);
-			PROF_STOP(P_COPY_XDIFF);
-			PROF_COUNT(prof_copy_xdiffs, 1);
 
 			if (error == 0 && potential[1].suspect) {
-#ifdef GIT_BLAME_PROFILE
-				unsigned score = blame_entry_score(blame,
-					&potential[1]);
-				if (score > threshold)
-					prof_copy_useful++;
-				if (prune && s->filtered && score > bar &&
-				    !blame_source_can_match(s, &lines[j], score - 1)) {
-					prof_prune_violations++;
-					fprintf(stderr, "BOUND VIOLATION %s score=%u\n",
-						s->path, score);
-				}
-#endif
 				copy_split_if_better(blame, c->split, potential);
 				best[j] = blame_entry_score(blame, &c->split[1]);
 			}
@@ -2452,14 +2302,21 @@ int git_blame_cache_new(
 	cache = git__calloc(1, sizeof(*cache));
 	GIT_ERROR_CHECK_ALLOC(cache);
 
+	cache->gitdir = git__strdup(git_repository_path(repo));
+	if (!cache->gitdir) {
+		git__free(cache);
+		git_error_set_oom();
+		return -1;
+	}
+
 	if (git_mutex_init(&cache->lock) < 0 ||
 	    git_cond_init(&cache->ready) < 0) {
 		git_error_set(GIT_ERROR_THREAD, "unable to init the blame cache");
+		git__free(cache->gitdir);
 		git__free(cache);
 		return -1;
 	}
 
-	cache->repo = repo;
 	cache->stats.max_bytes = max_bytes ? max_bytes : BLAME_CACHE_DEFAULT_BYTES;
 	*out = cache;
 	return 0;
@@ -2480,6 +2337,7 @@ void git_blame_cache_free(git_blame_cache *cache)
 	blame_source_listmap_dispose(&cache->lists);
 	git_cond_free(&cache->ready);
 	git_mutex_free(&cache->lock);
+	git__free(cache->gitdir);
 	git__free(cache);
 }
 
@@ -2491,7 +2349,11 @@ void git_blame_cache_get_stats(
 
 	if (!out || !cache)
 		return;
-	git_mutex_lock(&c->lock);
+	if (git_mutex_lock(&c->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock the blame cache");
+		memset(out, 0, sizeof(*out));
+		return;
+	}
 	memcpy(out, &c->stats, sizeof(*out));
 	git_mutex_unlock(&c->lock);
 }
@@ -2538,12 +2400,6 @@ static int find_copy_in_parent(
 	blame_source_list *list = NULL;
 	size_t i;
 	int error = 0;
-#ifdef GIT_BLAME_PROFILE
-	double c0, d0 = prof_t[P_COPY_DIFF], ld0 = prof_t[P_COPY_LOAD],
-		x0 = prof_t[P_COPY_XDIFF];
-	size_t s0 = prof_copy_sources, b0 = prof_copy_bytes, ncand, rounds = 0;
-	PROF_VARS;
-#endif
 
 	for (e = blame->ent; e; e = e->next) {
 		if (e->guilty || !same_suspect(e->suspect, target))
@@ -2557,30 +2413,16 @@ static int find_copy_in_parent(
 		goto done;
 	}
 
-#ifdef GIT_BLAME_PROFILE
-	c0 = prof_now();
-	ncand = git_array_size(candidates);
-	PROF_START();
-#endif
 	if (blame->cache)
 		error = blame_cache_sources(&list, blame, target, parent,
 			porigin, opt);
 	else
 		error = diff_copy_sources(&diff, blame, target, parent,
 			porigin, opt);
-#ifdef GIT_BLAME_PROFILE
-	PROF_STOP(P_COPY_DIFF);
-	prof_copy_searches++;
-	if (diff)
-		prof_copy_deltas += git_diff_num_deltas(diff);
-#endif
 	if (error < 0)
 		goto done;
 
 	while (git_array_size(candidates)) {
-#ifdef GIT_BLAME_PROFILE
-		rounds++;
-#endif
 		if ((error = find_best_copies(blame, &candidates, parent,
 				diff, list, porigin)) < 0)
 			goto done;
@@ -2607,23 +2449,6 @@ static int find_copy_in_parent(
 		candidates = next;
 		git_array_init(next);
 	}
-
-#ifdef GIT_BLAME_PROFILE
-	if (prof_log()) {
-		char a[GIT_OID_MAX_HEXSIZE + 1], b[GIT_OID_MAX_HEXSIZE + 1];
-		git_oid_tostr(a, sizeof(a), git_commit_id(target->commit));
-		git_oid_tostr(b, sizeof(b), git_commit_id(parent));
-		fprintf(prof_log(),
-			"C %s %s %d %zu %zu %zu %zu %zu %.6f %.6f %.6f %.6f\n",
-			a, b, (int)!!(opt & (GIT_BLAME_TRACK_COPIES_ANY_COMMIT_COPIES |
-			GIT_BLAME_TRACK_COPIES_SAME_COMMIT_COPIES)),
-			diff ? git_diff_num_deltas(diff) : (list ? list->count : 0),
-			prof_copy_sources - s0,
-			prof_copy_bytes - b0, ncand, rounds,
-			prof_now() - c0, prof_t[P_COPY_DIFF] - d0,
-			prof_t[P_COPY_LOAD] - ld0, prof_t[P_COPY_XDIFF] - x0);
-	}
-#endif
 
 	/* Is any line left that is worth a search in another parent? */
 	error = 1;
@@ -2686,10 +2511,7 @@ static int pass_blame(git_blame *blame, git_blame__origin *origin, uint32_t opt)
 				goto finish;
 
 			if (pass == 0) {
-				PROF_VARS;
-				PROF_START();
 				error = find_origin(&porigin, blame, p, origin);
-				PROF_STOP(P_FIND_ORIGIN);
 			} else {
 				error = find_rename(&porigin, blame, p, origin);
 			}
@@ -2873,24 +2695,6 @@ int git_blame__like_git(git_blame *blame, uint32_t opt)
 
 	if (!error)
 		coalesce(blame);
-
-#ifdef GIT_BLAME_PROFILE
-	if (prof_log()) {
-		int ph;
-		fprintf(prof_log(), "T");
-		for (ph = 0; ph < P_NPHASES; ph++)
-			fprintf(prof_log(), " %s=%.6f/%.6f", prof_names[ph],
-				prof_t[ph], prof_prep[ph]);
-		fprintf(prof_log(), " copy_searches=%zu copy_deltas=%zu"
-			" copy_sources=%zu copy_bytes=%zu copy_xdiffs=%zu"
-			" copy_useful=%zu rename_inexact=%zu rename_srcs=%zu"
-			" rename_bytes=%zu prune_violations=%zu\n", prof_copy_searches,
-			prof_copy_deltas, prof_copy_sources, prof_copy_bytes,
-			prof_copy_xdiffs, prof_copy_useful, prof_rename_inexact,
-			prof_rename_srcs, prof_rename_bytes, prof_prune_violations);
-		fflush(prof_log());
-	}
-#endif
 
 	return error;
 }

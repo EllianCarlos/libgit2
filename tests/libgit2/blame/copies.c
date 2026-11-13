@@ -430,3 +430,21 @@ void test_blame_copies__cache_prunes_sources(void)
 	cl_assert_equal_i(st.source_checks, st.source_pruned + st.source_xdiffs);
 	git_blame_cache_free(cache);
 }
+
+void test_blame_copies__cache_of_another_repository_fails(void)
+{
+	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
+	git_repository *other;
+	git_blame_cache *cache;
+
+	cl_git_pass(git_repository_init(&other, "other.git", true));
+	cl_git_pass(git_blame_cache_new(&cache, other, 0));
+
+	cl_git_fail(git_blame_file_cached(&g_blame, g_repo, "to.txt", &opts,
+		cache));
+	cl_assert_equal_p(NULL, g_blame);
+	cl_assert(git_error_last() != NULL);
+
+	git_blame_cache_free(cache);
+	git_repository_free(other);
+}
